@@ -1,0 +1,52 @@
+#!/bin/sh
+
+DAEMON="masinaclient"
+PIDFILE="/var/run/$DAEMON.pid"
+DAEMON_ARGS="-s"
+
+if [ -e /etc/masina.conf ]; then
+	. /etc/masina.conf
+fi
+
+start() {
+	if [ "$enabled" = "true" ]; then
+		echo -n "Starting Masina client..."
+		start-stop-daemon -b -m -S -q -p "$PIDFILE" -x "$DAEMON" -- $DAEMON_ARGS
+		if [ $? -eq 0 ]; then
+			echo "OK"
+		else
+			echo "FAIL"
+		fi
+	else
+		echo "Masinaclient is disabled in /etc/masina.conf"
+		exit 1
+	fi
+}
+
+stop() {
+	echo -n "Stopping Masina client: "
+	start-stop-daemon -K -q -p "$PIDFILE"
+	if [ $? -eq 0 ]; then
+		rm -f "$PIDFILE"
+		echo "OK"
+	else
+		echo "FAIL"
+	fi
+}
+
+case "$1" in
+start | stop)
+	$1
+	;;
+
+restart | reload)
+	stop
+	sleep 3
+	start
+	;;
+
+*)
+	echo "Usage: $0 {start|stop|restart|reload}"
+	exit 1
+	;;
+esac

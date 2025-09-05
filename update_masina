@@ -1,0 +1,26 @@
+#!/bin/sh
+MASINA_CONFIG="/etc/masina.conf"
+
+# Load configuration as shell variables
+if [ -e "$MASINA_CONFIG" ]; then
+    . "$MASINA_CONFIG"
+else
+    echo "Error: Config file $MASINA_CONFIG not found." >&2
+    exit 1
+fi
+
+# Verify IP is set
+if [ -z "$GROUND_IP" ]; then
+    echo "Error: GROUND_IP variable not set in configuration." >&2
+    exit 1
+fi
+
+# Run yaml-cli command
+yaml-cli -s .outgoing.server "udp://$GROUND_IP:2222"
+if [ $? -eq 0 ]; then
+    echo "yaml-cli command executed successfully."
+    exit 0
+else
+    echo "Error: Failed to execute yaml-cli command." >&2
+    exit 1
+fi
