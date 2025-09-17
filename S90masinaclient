@@ -11,6 +11,7 @@ fi
 start() {
 	if [ "$enabled" = "true" ]; then
 		echo -n "Starting Masina client..."
+		update_masina
 		start-stop-daemon -b -m -S -q -p "$PIDFILE" -x "$DAEMON" -- $DAEMON_ARGS
 		if [ $? -eq 0 ]; then
 			echo "OK"
