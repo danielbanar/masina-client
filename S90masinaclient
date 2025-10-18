@@ -2,7 +2,7 @@
 
 DAEMON="masinaclient"
 PIDFILE="/var/run/$DAEMON.pid"
-DAEMON_ARGS="-s"
+DAEMON_ARGS=""
 
 if [ -e /etc/masina.conf ]; then
 	. /etc/masina.conf
