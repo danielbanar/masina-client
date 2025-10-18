@@ -254,34 +254,34 @@ int main()
                     auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastSentPayload).count();
                     if (elapsedTime > 10)
                     {
-                        static uint8_t payload[26];
-                        payload[0] = 0xC8;
-                        payload[1] = 0x18;
-                        payload[2] = 0x16;
-                        payload[3] = (channels[0] & 0xFF);
-                        payload[4] = ((channels[0] >> 8) & 0x07) | ((channels[1] & 0x1F) << 3);
-                        payload[5] = ((channels[1] >> 5) & 0x3F) | ((channels[2] & 0x03) << 6);
-                        payload[6] = ((channels[2] >> 2) & 0xFF);
-                        payload[7] = ((channels[2] >> 10) & 0x01) | ((channels[3] & 0x7F) << 1);
-                        payload[8] = ((channels[3] >> 7) & 0x0F) | ((channels[4] & 0x0F) << 4);
-                        payload[9] = ((channels[4] >> 4) & 0x7F) | ((channels[5] & 0x01) << 7);
-                        payload[10] = ((channels[5] >> 1) & 0xFF);
-                        payload[11] = ((channels[5] >> 9) & 0x03) | ((channels[6] & 0x3F) << 2);
-                        payload[12] = ((channels[6] >> 6) & 0x1F) | ((channels[7] & 0x07) << 5);
-                        payload[13] = ((channels[7] >> 3) & 0xFF);
-                        payload[14] = (channels[8] & 0xFF);
-                        payload[15] = ((channels[8] >> 8) & 0x07) | ((channels[9] & 0x1F) << 3);
-                        payload[16] = ((channels[9] >> 5) & 0x3F) | ((channels[10] & 0x03) << 6);
-                        payload[17] = ((channels[10] >> 2) & 0xFF);
-                        payload[18] = ((channels[10] >> 10) & 0x01) | ((channels[11] & 0x7F) << 1);
-                        payload[19] = ((channels[11] >> 7) & 0x0F) | ((channels[12] & 0x0F) << 4);
-                        payload[20] = ((channels[12] >> 4) & 0x7F) | ((channels[13] & 0x01) << 7);
-                        payload[21] = ((channels[13] >> 1) & 0xFF);
-                        payload[22] = ((channels[13] >> 9) & 0x03) | ((channels[14] & 0x3F) << 2);
-                        payload[23] = ((channels[14] >> 6) & 0x1F) | ((channels[15] & 0x07) << 5);
-                        payload[24] = ((channels[15] >> 3) & 0xFF);
-                        payload[25] = CRC8(payload, 2, 0x18 - 1);
-                        ssize_t bytes_written = write(serialPort, payload, 26);
+                        static uint8_t crsfPayload[26];
+                        crsfPayload[0] = 0xC8;
+                        crsfPayload[1] = 0x18;
+                        crsfPayload[2] = 0x16;
+                        crsfPayload[3] = (channels[0] & 0xFF);
+                        crsfPayload[4] = ((channels[0] >> 8) & 0x07) | ((channels[1] & 0x1F) << 3);
+                        crsfPayload[5] = ((channels[1] >> 5) & 0x3F) | ((channels[2] & 0x03) << 6);
+                        crsfPayload[6] = ((channels[2] >> 2) & 0xFF);
+                        crsfPayload[7] = ((channels[2] >> 10) & 0x01) | ((channels[3] & 0x7F) << 1);
+                        crsfPayload[8] = ((channels[3] >> 7) & 0x0F) | ((channels[4] & 0x0F) << 4);
+                        crsfPayload[9] = ((channels[4] >> 4) & 0x7F) | ((channels[5] & 0x01) << 7);
+                        crsfPayload[10] = ((channels[5] >> 1) & 0xFF);
+                        crsfPayload[11] = ((channels[5] >> 9) & 0x03) | ((channels[6] & 0x3F) << 2);
+                        crsfPayload[12] = ((channels[6] >> 6) & 0x1F) | ((channels[7] & 0x07) << 5);
+                        crsfPayload[13] = ((channels[7] >> 3) & 0xFF);
+                        crsfPayload[14] = (channels[8] & 0xFF);
+                        crsfPayload[15] = ((channels[8] >> 8) & 0x07) | ((channels[9] & 0x1F) << 3);
+                        crsfPayload[16] = ((channels[9] >> 5) & 0x3F) | ((channels[10] & 0x03) << 6);
+                        crsfPayload[17] = ((channels[10] >> 2) & 0xFF);
+                        crsfPayload[18] = ((channels[10] >> 10) & 0x01) | ((channels[11] & 0x7F) << 1);
+                        crsfPayload[19] = ((channels[11] >> 7) & 0x0F) | ((channels[12] & 0x0F) << 4);
+                        crsfPayload[20] = ((channels[12] >> 4) & 0x7F) | ((channels[13] & 0x01) << 7);
+                        crsfPayload[21] = ((channels[13] >> 1) & 0xFF);
+                        crsfPayload[22] = ((channels[13] >> 9) & 0x03) | ((channels[14] & 0x3F) << 2);
+                        crsfPayload[23] = ((channels[14] >> 6) & 0x1F) | ((channels[15] & 0x07) << 5);
+                        crsfPayload[24] = ((channels[15] >> 3) & 0xFF);
+                        crsfPayload[25] = CRC8(crsfPayload, 2, 0x18 - 1);
+                        ssize_t bytes_written = write(serialPort, crsfPayload, 26);
                         /*static uint8_t linkPayload[15] = "\xC8\x0C\x14\x10\x17\x64\x05\x00\x01\x01\x00\x00\x00\x59"; //Dummy data
                         bytes_written = write(serialPort, linkPayload, 14);*/
                         lastSentPayload = currentTime;
@@ -329,6 +329,13 @@ int main()
                         continue;
                     }
 
+                    /*printf("CHANNELS: ");
+                    for (size_t i = 0; i < payloadLength; i++)
+                    {
+                        printf("%5d",payload[i]);
+                    }
+                    printf("\n");*/
+
                     // Valid payload
                     static unsigned long lastN = 0;
                     unsigned long N = std::stol(matches[2]);
@@ -336,9 +343,11 @@ int main()
                     {
                         lastN = N;
                         lastValidPayload = std::chrono::high_resolution_clock::now();
-                        memcpy(channels, payload + 1, 8 * sizeof(uint16_t));
-                        bool remote = std::stoi(matches[12]) == 2000;
-                        fsMode = std::stoi(matches[13]) == 2000;
+                        for (size_t i = 0; i < payloadLength - 1; i++)
+                            channels[i] = US_TO_CRSF(payload[i + 1]);
+
+                        fsMode = matches[10] == 2000;
+                        bool remote = payload[9] == 2000;
                         static bool lastRemoteState = false;
                         if (remote != lastRemoteState)
                         {
