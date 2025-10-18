@@ -181,7 +181,8 @@ int main()
     int sockfd = initializeSocket(gConfig.groundIP, 2223, serverAddr);
     uint8_t dummybuf[5] = "INIT";
     sendto(sockfd, dummybuf, 5, 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
-    std::cout << "INIT SENT";
+    if (gConfig.debug)
+        printf("Sent: Init\n");
     while (true)
     {
         usleep(1000);
@@ -197,6 +198,8 @@ int main()
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
+                    if (gConfig.debug)
+                        printf("Serial read bytes: %d %d\n", serialReadBytes, errno);
                 }
                 else
                 {
@@ -210,6 +213,8 @@ int main()
             }
             else
             {
+                if (gConfig.debug)
+                    printf("Serial read bytes: %d\n", serialReadBytes);
                 sendto(sockfd, serialBuffer, serialReadBytes, 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
             }
 
@@ -240,11 +245,11 @@ int main()
                     {
                         // No data for 250ms - STABILIZE
                         // std::cerr << "STABILIZE_TIMEOUT\n";
-                        channels[0] = CRSF_CHANNEL_VALUE_MID;                 // ROLL
-                        channels[1] = CRSF_CHANNEL_VALUE_MID;                 // PITCH
+                        channels[0] = CRSF_CHANNEL_VALUE_MID;         // ROLL
+                        channels[1] = CRSF_CHANNEL_VALUE_MID;         // PITCH
                         channels[2] = US_TO_CRSF(gConfig.hoverValue); // THROTTLE
-                        channels[3] = CRSF_CHANNEL_VALUE_MID;                 // YAW
-                        channels[5] = CRSF_CHANNEL_VALUE_MIN;                 // ANGLE MODE MODE
+                        channels[3] = CRSF_CHANNEL_VALUE_MID;         // YAW
+                        channels[5] = CRSF_CHANNEL_VALUE_MIN;         // ANGLE MODE MODE
                     }
                     auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastSentPayload).count();
                     if (elapsedTime > 10)
@@ -300,10 +305,9 @@ int main()
                 std::string strRegexpattern = "^CTL";
                 for (size_t i = 0; i < gConfig.rcChannels + 3; i++) // Length + N + RC channels + CRC16
                     strRegexpattern += ",(-?\\d+)";
-                strRegexpattern += "$";
+                strRegexpattern += "\r?\n?$";
 
                 static std::regex regexPattern(strRegexpattern);
-
                 std::cmatch matches;
                 if (std::regex_search(rxBuffer, matches, regexPattern))
                 {
@@ -311,16 +315,20 @@ int main()
                     if (payloadLength != gConfig.rcChannels + 1)
                         continue;
 
-                    uint16_t* payload = new uint16_t[payloadLength]; 
-                    for (int i = 0; i < gConfig.rcChannels; i++) // Populate payload with rc channels
-                        payload[i] = std::stoi(matches[i + 3]) & 0xFFFF;
+                    uint16_t* payload = new uint16_t[payloadLength];
+                    payload[0] = std::stoi(matches[2]) & 0xFFFF;
+                    for (int i = 1; i <= gConfig.rcChannels; i++) // Populate payload with rc channels
+                        payload[i] = std::stoi(matches[i + 2]) & 0xFFFF;
 
                     uint16_t crcRecv = std::stoi(matches[matches.size() - 1]);
                     uint16_t crcCalc = CRC16(payload, payloadLength);
-                    printf("CRC16: recv=%d calc=%d\n", crcRecv, crcCalc);
+                    // printf("CRC16: recv=%d calc=%d\n", crcRecv, crcCalc);
                     if (crcRecv != crcCalc)
+                    {
+                        printf("CRC16 missmatch: recv=%d calc=%d\n", crcRecv, crcCalc);
                         continue;
-                    
+                    }
+
                     // Valid payload
                     static unsigned long lastN = 0;
                     unsigned long N = std::stol(matches[2]);
@@ -355,7 +363,7 @@ int main()
                 }
                 else
                 {
-                    std::cout << "Received: " << rxBuffer;
+                    std::cout << "Received on CRSF: " << rxBuffer;
                 }
             }
         }

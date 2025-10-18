@@ -13,6 +13,8 @@ void Config::print() const
     std::cout << "  hoverValue: " << hoverValue << std::endl;
     std::cout << "  groundIP: " << groundIP << std::endl;
     std::cout << "  rcChannels: " << rcChannels << std::endl;
+    std::cout << "  serialPort: " << serialPort << std::endl;
+    std::cout << "  debug: " << debug << std::endl;
 }
 
 bool Config::readConfig(const std::string& filename)
@@ -47,6 +49,8 @@ bool Config::readConfig(const std::string& filename)
                 rcChannels = std::stoi(value);
             else if (key == "SERIAL_PORT")
                 serialPort = value;
+            else if (key == "DEBUG")
+                debug = std::stoi(value);
         }
     }
     return true;
@@ -181,6 +185,7 @@ void getSignalStrength(int& rssi, int& snr)
 }
 std::string getServingCellInfo()
 {
+    return "";
     // Command to send AT command and read response from /dev/ttyUSB2
     const char* command = "at_command";
 

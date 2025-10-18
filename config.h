@@ -14,6 +14,7 @@ struct Config
     std::string groundIP;
     uint32_t rcChannels = 12;
     std::string serialPort = "/dev/ttyS2";
+    bool debug = false;
 
     bool readConfig(const std::string& filename);
     void print() const;
