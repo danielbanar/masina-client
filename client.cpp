@@ -231,15 +231,18 @@ int main()
                     if (elapsedTimeValid >= gConfig.localTimeout)
                     {
                         // No data for 5m - Switch to local controller
-                        std::cerr << "LOCAL TIMEOUT!\n";
                         std::string command = "gpio clear " + std::to_string(gConfig.elrsSwitchPin);
                         std::system(command.c_str());
+                        if (gConfig.debug)
+                            printf("LOCAL TIMEOUT!\n");
                     }
                     else if (elapsedTimeValid >= gConfig.failsafeTimeout)
                     {
                         // No data for 5s - Failsafe
                         // std::cerr << "FAILSAFE_TIMEOUT\n";
-                        channels[11] = fsMode ? CRSF_CHANNEL_VALUE_2000 : CRSF_CHANNEL_VALUE_1000;
+                        channels[11] = fsMode ? CRSF_CHANNEL_VALUE_2000 : CRSF_CHANNEL_VALUE_MID;
+                        if (gConfig.debug)
+                            printf("FS TIMEOUT!\n");
                     }
                     else if (elapsedTimeValid >= gConfig.stabTimeout)
                     {
@@ -250,6 +253,8 @@ int main()
                         channels[2] = US_TO_CRSF(gConfig.hoverValue); // THROTTLE
                         channels[3] = CRSF_CHANNEL_VALUE_MID;         // YAW
                         channels[5] = CRSF_CHANNEL_VALUE_MIN;         // ANGLE MODE MODE
+                        if (gConfig.debug)
+                            printf("STAB TIMEOUT!\n");
                     }
                     auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastSentPayload).count();
                     if (elapsedTime > 10)
