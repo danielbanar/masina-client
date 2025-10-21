@@ -240,7 +240,7 @@ int main()
                     {
                         // No data for 5s - Failsafe
                         // std::cerr << "FAILSAFE_TIMEOUT\n";
-                        crsfChannels[10] = fsMode ? US_TO_CRSF(2000) : US_TO_CRSF(1500);
+                        crsfChannels[10] = fsMode ? US_TO_CRSF(1500) : US_TO_CRSF(2000);
                         if (gConfig.debug)
                             printf("FS TIMEOUT! - %s", fsMode ? "LAND\n" : "GPS\n");
                     }
