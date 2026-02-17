@@ -82,7 +82,7 @@ NetworkUsage getNetworkUsage()
         if (!iface.empty() && iface.back() == ':')
             iface.pop_back();
 
-        if (iface == "usb0")
+        if (iface == "usb0" || iface == "wwan0")
         {
             unsigned long rx_bytes, dummy, tx_bytes;
 
