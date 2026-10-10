@@ -139,6 +139,9 @@ int main()
 
     gConfig.print();
 
+    if (gConfig.debug >= 2 && !rxLogOpen())
+        perror("Failed to open " RX_LOG_PATH);
+
     std::thread PiTelemetryThread(PiTelemetry);
 
     int serialPort = open(gConfig.serialPort.c_str(), O_RDWR);
@@ -221,7 +224,7 @@ int main()
             char rxBuffer[128];
             sockaddr_in clientAddr{};
             socklen_t addrLen = sizeof(clientAddr);
-            ssize_t bytesRead = recvfrom(sockfd, rxBuffer, sizeof(rxBuffer), 0, (struct sockaddr*)&clientAddr, &addrLen);
+            ssize_t bytesRead = recvfrom(sockfd, rxBuffer, sizeof(rxBuffer) - 1, 0, (struct sockaddr*)&clientAddr, &addrLen);
             if (bytesRead == -1)
             {
                 if (errno == EWOULDBLOCK || errno == EAGAIN)
@@ -307,6 +310,7 @@ int main()
             else if (bytesRead > 0)
             {
                 rxBuffer[bytesRead] = '\0';
+                rxLog(rxBuffer, bytesRead);
                 std::string strRegexpattern = "^CTL";
                 for (size_t i = 0; i < gConfig.rcChannels + 3; i++) // Length + N + RC channels + CRC16
                     strRegexpattern += ",(-?\\d+)";
@@ -319,7 +323,7 @@ int main()
                     size_t payloadLength = std::stol(matches[1]); // N + RC channels
                     if (payloadLength != gConfig.rcChannels + 1)
                         continue;
-
+                    //TODO: optimise for stack
                     uint16_t* payload = new uint16_t[payloadLength];
                     payload[0] = std::stoi(matches[2]) & 0xFFFF;
                     for (int i = 1; i <= gConfig.rcChannels; i++) // Populate payload with rc channels
@@ -331,6 +335,7 @@ int main()
                     if (crcRecv != crcCalc)
                     {
                         printf("CRC16 missmatch: recv=%d calc=%d\n", crcRecv, crcCalc);
+                        delete[] payload;
                         continue;
                     }
 

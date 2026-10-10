@@ -1,5 +1,10 @@
 #include "utils.h"
 #include "config.h"
+#include <cstdio>
+#include <ctime>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 Config config;
 
@@ -52,6 +57,12 @@ bool Config::readConfig(const std::string& filename)
             else if (key == "DEBUG")
                 debug = std::stoi(value);
         }
+    }
+
+    if (rcChannels > 16) // CRSF carries 16 channels
+    {
+        std::cerr << "RC_CHANNELS must be at most 16, got " << rcChannels << std::endl;
+        return false;
     }
     return true;
 }
@@ -251,4 +262,59 @@ uint8_t CRC8(const uint8_t* data, size_t start, size_t length)
     }
 
     return crc;
+}
+
+static int gFd = -1;
+static size_t gSize = 0;
+
+static bool openFile(int extraFlags)
+{
+    gFd = open(RX_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | extraFlags, 0644);
+    if (gFd < 0)
+        return false;
+    struct stat st;
+    gSize = fstat(gFd, &st) == 0 ? st.st_size : 0;
+    return true;
+}
+
+bool rxLogOpen()
+{
+    if (gFd >= 0)
+        return true;
+    return openFile(0);
+}
+
+void rxLog(const char* msg, size_t len)
+{
+    if (gFd < 0)
+        return;
+
+    char line[256];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm t;
+    localtime_r(&ts.tv_sec, &t);
+    size_t n = strftime(line, sizeof(line), "%Y-%m-%dT%H:%M:%S", &t);
+    n += snprintf(line + n, sizeof(line) - n, ".%03ld ", ts.tv_nsec / 1000000);
+
+    // Strip trailing line endings; replace non-printable bytes so malformed input stays one line
+    while (len > 0 && (msg[len - 1] == '\n' || msg[len - 1] == '\r'))
+        len--;
+    for (size_t i = 0; i < len && n < sizeof(line) - 1; i++)
+    {
+        unsigned char c = msg[i];
+        line[n++] = (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+    line[n++] = '\n';
+
+    ssize_t written = write(gFd, line, n);
+    if (written > 0)
+        gSize += written;
+
+    if (gSize >= RX_LOG_MAX_BYTES)
+    {
+        close(gFd);
+        rename(RX_LOG_PATH, RX_LOG_PATH ".1");
+        openFile(O_TRUNC);
+    }
 }
