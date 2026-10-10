@@ -1,8 +1,10 @@
 #include "utils.h"
 #include "config.h"
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <mntent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -266,10 +268,28 @@ uint8_t CRC8(const uint8_t* data, size_t start, size_t length)
 
 static int gFd = -1;
 static size_t gSize = 0;
+static char gPath[64];
+
+// True if LOG_DIR is a mount point and is mounted read-write
+static bool logDirWritable()
+{
+    FILE* mounts = setmntent("/proc/mounts", "r");
+    if (!mounts)
+        return false;
+    bool writable = false;
+    struct mntent* m;
+    while ((m = getmntent(mounts)) != nullptr)
+    {
+        if (strcmp(m->mnt_dir, LOG_DIR) == 0)
+            writable = hasmntopt(m, "rw") != nullptr; // last match wins (remounts stack)
+    }
+    endmntent(mounts);
+    return writable && access(LOG_DIR, W_OK) == 0;
+}
 
 static bool openFile(int extraFlags)
 {
-    gFd = open(RX_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | extraFlags, 0644);
+    gFd = open(gPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | extraFlags, 0644);
     if (gFd < 0)
         return false;
     struct stat st;
@@ -281,7 +301,19 @@ bool rxLogOpen()
 {
     if (gFd >= 0)
         return true;
-    return openFile(0);
+    if (!logDirWritable())
+        return false;
+
+    time_t now = time(nullptr);
+    struct tm t;
+    localtime_r(&now, &t);
+    char stamp[32];
+    strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &t);
+    snprintf(gPath, sizeof(gPath), LOG_DIR "/masina_%s.log", stamp);
+    if (!openFile(0))
+        return false;
+    printf("Logging to %s\n", gPath);
+    return true;
 }
 
 void rxLog(const char* msg, size_t len)
@@ -311,10 +343,12 @@ void rxLog(const char* msg, size_t len)
     if (written > 0)
         gSize += written;
 
-    if (gSize >= RX_LOG_MAX_BYTES)
+    if (gSize >= LOG_MAX_BYTES)
     {
         close(gFd);
-        rename(RX_LOG_PATH, RX_LOG_PATH ".1");
+        char rotated[sizeof(gPath) + 2];
+        snprintf(rotated, sizeof(rotated), "%s.1", gPath);
+        rename(gPath, rotated);
         openFile(O_TRUNC);
     }
 }

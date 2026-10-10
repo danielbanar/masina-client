@@ -21,10 +21,11 @@ std::string getServingCellInfo() ;
 int16_t CRC16(uint16_t* data, size_t length);
 uint8_t CRC8(const uint8_t* data, size_t start, size_t length);
 
-// Lightweight receive logger. Writes to /tmp only (tmpfs, RAM-backed), so the file is
-// size-capped and rotated once (<path>.1). No heap allocation per entry.
-#define RX_LOG_PATH "/tmp/masina_rx.log"
-#define RX_LOG_MAX_BYTES (256 * 1024)
+// Lightweight receive logger. Writes to LOG_DIR/masina_<date>_<time>.log, only if LOG_DIR is a
+// mounted rw filesystem (SD card). The file is size-capped and rotated once (<path>.1).
+// No heap allocation per entry.
+#define LOG_DIR "/mnt/mmcblk0p1"
+#define LOG_MAX_BYTES (256 * 1024)
 
 bool rxLogOpen();
 void rxLog(const char* msg, size_t len);

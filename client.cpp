@@ -140,7 +140,7 @@ int main()
     gConfig.print();
 
     if (gConfig.debug >= 2 && !rxLogOpen())
-        perror("Failed to open " RX_LOG_PATH);
+        printf("Log file disabled: " LOG_DIR " not mounted rw or file open failed\n");
 
     std::thread PiTelemetryThread(PiTelemetry);
 
@@ -186,6 +186,8 @@ int main()
     sendto(sockfd, dummybuf, 5, 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
     if (gConfig.debug)
         printf("Sent: Init\n");
+    if (gConfig.debug >= 2)
+        rxLog("Sent: Init", 10);
     while (true)
     {
         usleep(1000);
@@ -203,6 +205,12 @@ int main()
                 {
                     if (gConfig.debug)
                         printf("Serial read bytes: %d %d\n", serialReadBytes, errno);
+                    if (gConfig.debug >= 2)
+                    {
+                        char buf[64];
+                        int n = snprintf(buf, sizeof(buf), "Serial read bytes: %d %d", serialReadBytes, errno);
+                        rxLog(buf, n);
+                    }
                 }
                 else
                 {
@@ -218,6 +226,12 @@ int main()
             {
                 if (gConfig.debug)
                     printf("Serial read bytes: %d\n", serialReadBytes);
+                if (gConfig.debug >= 2)
+                {
+                    char buf[64];
+                    int n = snprintf(buf, sizeof(buf), "Serial read bytes: %d", serialReadBytes);
+                    rxLog(buf, n);
+                }
                 sendto(sockfd, serialBuffer, serialReadBytes, 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
             }
 
@@ -238,6 +252,8 @@ int main()
                         std::system(command.c_str());
                         if (gConfig.debug)
                             printf("LOCAL TIMEOUT!\n");
+                        if (gConfig.debug >= 2)
+                            rxLog("LOCAL TIMEOUT!", 14);
                     }
                     else if (elapsedTimeValid >= gConfig.failsafeTimeout)
                     {
@@ -246,6 +262,12 @@ int main()
                         crsfChannels[10] = fsMode ? US_TO_CRSF(1500) : US_TO_CRSF(2000);
                         if (gConfig.debug)
                             printf("FS TIMEOUT! - %s", fsMode ? "LAND\n" : "GPS\n");
+                        if (gConfig.debug >= 2)
+                        {
+                            char buf[64];
+                            int n = snprintf(buf, sizeof(buf), "FS TIMEOUT! - %s", fsMode ? "LAND" : "GPS");
+                            rxLog(buf, n);
+                        }
                     }
                     else if (elapsedTimeValid >= gConfig.stabTimeout)
                     {
@@ -258,6 +280,8 @@ int main()
                         crsfChannels[5] = CRSF_CHANNEL_VALUE_MIN;         // ANGLE MODE MODE
                         if (gConfig.debug)
                             printf("STAB TIMEOUT!\n");
+                        if (gConfig.debug >= 2)
+                            rxLog("STAB TIMEOUT!", 13);
                     }
                     auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastSentPayload).count();
                     if (elapsedTime > 10)
