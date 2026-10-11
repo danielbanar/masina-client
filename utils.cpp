@@ -5,7 +5,6 @@
 #include <ctime>
 #include <fcntl.h>
 #include <mntent.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 Config config;
@@ -262,8 +261,6 @@ uint8_t CRC8(const uint8_t* data, size_t start, size_t length)
 }
 
 static int gFd = -1;
-static size_t gSize = 0;
-static char gPath[64];
 
 // True if LOG_DIR is a mount point and is mounted read-write
 static bool logDirWritable()
@@ -282,16 +279,6 @@ static bool logDirWritable()
     return writable && access(LOG_DIR, W_OK) == 0;
 }
 
-static bool openFile(int extraFlags)
-{
-    gFd = open(gPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | extraFlags, 0644);
-    if (gFd < 0)
-        return false;
-    struct stat st;
-    gSize = fstat(gFd, &st) == 0 ? st.st_size : 0;
-    return true;
-}
-
 static void openLogFile()
 {
     if (!logDirWritable())
@@ -305,13 +292,15 @@ static void openLogFile()
     localtime_r(&now, &t);
     char stamp[32];
     strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &t);
-    snprintf(gPath, sizeof(gPath), LOG_DIR "/masina_%s.log", stamp);
-    if (!openFile(0))
+    char path[64];
+    snprintf(path, sizeof(path), LOG_DIR "/masina_%s.log", stamp);
+    gFd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (gFd < 0)
     {
         perror("Failed to open log file");
         return;
     }
-    printf("Logging to %s\n", gPath);
+    printf("Logging to %s\n", path);
 }
 
 void Log(uint8_t mode, const char* msg, size_t len)
@@ -373,15 +362,4 @@ void Log(uint8_t mode, const char* msg, size_t len)
     line[n++] = '\n';
 
     ssize_t written = write(gFd, line, n);
-    if (written > 0)
-        gSize += written;
-
-    if (gSize >= LOG_MAX_BYTES)
-    {
-        close(gFd);
-        char rotated[sizeof(gPath) + 2];
-        snprintf(rotated, sizeof(rotated), "%s.1", gPath);
-        rename(gPath, rotated);
-        openFile(O_TRUNC);
-    }
 }
