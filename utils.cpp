@@ -297,7 +297,7 @@ static bool openFile(int extraFlags)
     return true;
 }
 
-bool rxLogOpen()
+bool LogOpen()
 {
     if (gFd >= 0)
         return true;
@@ -316,9 +316,11 @@ bool rxLogOpen()
     return true;
 }
 
-void rxLog(const char* msg, size_t len)
+void Log(const char* msg, size_t len, uint8_t mask)
 {
     if (gFd < 0)
+        mask &= ~LOG_FILE;
+    if (!mask)
         return;
 
     char line[256];
@@ -328,6 +330,7 @@ void rxLog(const char* msg, size_t len)
     localtime_r(&ts.tv_sec, &t);
     size_t n = strftime(line, sizeof(line), "%Y-%m-%dT%H:%M:%S", &t);
     n += snprintf(line + n, sizeof(line) - n, ".%03ld ", ts.tv_nsec / 1000000);
+    size_t msgStart = n;
 
     // Strip trailing line endings; replace non-printable bytes so malformed input stays one line
     while (len > 0 && (msg[len - 1] == '\n' || msg[len - 1] == '\r'))
@@ -338,6 +341,11 @@ void rxLog(const char* msg, size_t len)
         line[n++] = (c >= 0x20 && c < 0x7F) ? c : '.';
     }
     line[n++] = '\n';
+
+    if (mask & LOG_CONSOLE)
+        fwrite(line + msgStart, 1, n - msgStart, stdout);
+    if (!(mask & LOG_FILE))
+        return;
 
     ssize_t written = write(gFd, line, n);
     if (written > 0)

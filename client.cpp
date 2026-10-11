@@ -132,6 +132,7 @@ void PiTelemetry()
     receiveThread.join();
     close(sockfd);
 }
+
 int main()
 {
     if (!gConfig.readConfig("/etc/masina.conf"))
@@ -139,8 +140,11 @@ int main()
 
     gConfig.print();
 
-    if (gConfig.debug >= 2 && !rxLogOpen())
+    if (gConfig.debug >= 2 && !LogOpen())
         printf("Log file disabled: " LOG_DIR " not mounted rw or file open failed\n");
+
+    // debug 1: console, debug 2: file. The file is only open at debug >= 2, so debug 0 logs nothing
+    const uint8_t logMask = gConfig.debug == 1 ? LOG_CONSOLE : LOG_FILE;
 
     std::thread PiTelemetryThread(PiTelemetry);
 
@@ -184,10 +188,7 @@ int main()
     int sockfd = initializeSocket(gConfig.groundIP, 2223, serverAddr);
     uint8_t dummybuf[5] = "INIT";
     sendto(sockfd, dummybuf, 5, 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
-    if (gConfig.debug)
-        printf("Sent: Init\n");
-    if (gConfig.debug >= 2)
-        rxLog("Sent: Init", 10);
+    Log("Sent: Init", 10, logMask);
     while (true)
     {
         usleep(1000);
@@ -203,13 +204,11 @@ int main()
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
-                    if (gConfig.debug)
-                        printf("Serial read bytes: %d %d\n", serialReadBytes, errno);
                     if (gConfig.debug >= 2)
                     {
                         char buf[64];
                         int n = snprintf(buf, sizeof(buf), "Serial read bytes: %d %d", serialReadBytes, errno);
-                        rxLog(buf, n);
+                        Log(buf, n, LOG_FILE);
                     }
                 }
                 else
@@ -224,13 +223,11 @@ int main()
             }
             else
             {
-                if (gConfig.debug)
-                    printf("Serial read bytes: %d\n", serialReadBytes);
                 if (gConfig.debug >= 2)
                 {
                     char buf[64];
                     int n = snprintf(buf, sizeof(buf), "Serial read bytes: %d", serialReadBytes);
-                    rxLog(buf, n);
+                    Log(buf, n, LOG_FILE);
                 }
                 sendto(sockfd, serialBuffer, serialReadBytes, 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
             }
@@ -250,10 +247,7 @@ int main()
                         // No data for 5m - Switch to local controller
                         std::string command = "gpio clear " + std::to_string(gConfig.elrsSwitchPin);
                         std::system(command.c_str());
-                        if (gConfig.debug)
-                            printf("LOCAL TIMEOUT!\n");
-                        if (gConfig.debug >= 2)
-                            rxLog("LOCAL TIMEOUT!", 14);
+                        Log("LOCAL TIMEOUT!", 14, logMask);
                     }
                     else if (elapsedTimeValid >= gConfig.failsafeTimeout)
                     {
@@ -261,12 +255,10 @@ int main()
                         // std::cerr << "FAILSAFE_TIMEOUT\n";
                         crsfChannels[10] = fsMode ? US_TO_CRSF(1500) : US_TO_CRSF(2000);
                         if (gConfig.debug)
-                            printf("FS TIMEOUT! - %s", fsMode ? "LAND\n" : "GPS\n");
-                        if (gConfig.debug >= 2)
                         {
                             char buf[64];
                             int n = snprintf(buf, sizeof(buf), "FS TIMEOUT! - %s", fsMode ? "LAND" : "GPS");
-                            rxLog(buf, n);
+                            Log(buf, n, logMask);
                         }
                     }
                     else if (elapsedTimeValid >= gConfig.stabTimeout)
@@ -278,10 +270,7 @@ int main()
                         crsfChannels[2] = US_TO_CRSF(gConfig.hoverValue); // THROTTLE
                         crsfChannels[3] = CRSF_CHANNEL_VALUE_MID;         // YAW
                         crsfChannels[5] = CRSF_CHANNEL_VALUE_MIN;         // ANGLE MODE MODE
-                        if (gConfig.debug)
-                            printf("STAB TIMEOUT!\n");
-                        if (gConfig.debug >= 2)
-                            rxLog("STAB TIMEOUT!", 13);
+                        Log("STAB TIMEOUT!", 13, logMask);
                     }
                     auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastSentPayload).count();
                     if (elapsedTime > 10)
@@ -334,7 +323,7 @@ int main()
             else if (bytesRead > 0)
             {
                 rxBuffer[bytesRead] = '\0';
-                rxLog(rxBuffer, bytesRead);
+                Log(rxBuffer, bytesRead, LOG_FILE);
                 std::string strRegexpattern = "^CTL";
                 for (size_t i = 0; i < gConfig.rcChannels + 3; i++) // Length + N + RC channels + CRC16
                     strRegexpattern += ",(-?\\d+)";
