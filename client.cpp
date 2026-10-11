@@ -132,6 +132,7 @@ void PiTelemetry()
     receiveThread.join();
     close(sockfd);
 }
+
 int main()
 {
     if (!gConfig.readConfig("/etc/masina.conf"))
@@ -181,11 +182,10 @@ int main()
     int sockfd = initializeSocket(gConfig.groundIP, 2223, serverAddr);
     uint8_t dummybuf[5] = "INIT";
     sendto(sockfd, dummybuf, 5, 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
-    if (gConfig.debug)
-        printf("Sent: Init\n");
+    Log(gConfig.debug, "Sent: Init");
     while (true)
     {
-        usleep(1000);
+        usleep(2000);
         static uint16_t crsfChannels[16] = {992, 992, 1716, 992, 191, 191, 191, 191, 997, 997, 997, 997, 0, 0, 1811, 1811};
         static bool fsMode = false;
         static auto lastValidPayload = std::chrono::high_resolution_clock::now();
@@ -198,12 +198,13 @@ int main()
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
-                    if (gConfig.debug)
-                        printf("Serial read bytes: %d %d\n", serialReadBytes, errno);
+                    char buf[64];
+                    int n = snprintf(buf, sizeof(buf), "Serial read bytes: %d %d", serialReadBytes, errno);
+                    Log(gConfig.debug, buf, n);
                 }
                 else
                 {
-                    perror("Failed to read from serial port");
+                    Log(gConfig.debug, "Failed to read from serial port");
                     usleep(100000);
                 }
             }
@@ -213,15 +214,16 @@ int main()
             }
             else
             {
-                if (gConfig.debug)
-                    printf("Serial read bytes: %d\n", serialReadBytes);
+                char buf[64];
+                int n = snprintf(buf, sizeof(buf), "Serial read bytes: %d", serialReadBytes);
+                Log(gConfig.debug, buf, n);
                 sendto(sockfd, serialBuffer, serialReadBytes, 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
             }
 
             char rxBuffer[128];
             sockaddr_in clientAddr{};
             socklen_t addrLen = sizeof(clientAddr);
-            ssize_t bytesRead = recvfrom(sockfd, rxBuffer, sizeof(rxBuffer), 0, (struct sockaddr*)&clientAddr, &addrLen);
+            ssize_t bytesRead = recvfrom(sockfd, rxBuffer, sizeof(rxBuffer) - 1, 0, (struct sockaddr*)&clientAddr, &addrLen);
             if (bytesRead == -1)
             {
                 if (errno == EWOULDBLOCK || errno == EAGAIN)
@@ -233,16 +235,16 @@ int main()
                         // No data for 5m - Switch to local controller
                         std::string command = "gpio clear " + std::to_string(gConfig.elrsSwitchPin);
                         std::system(command.c_str());
-                        if (gConfig.debug)
-                            printf("LOCAL TIMEOUT!\n");
+                        Log(gConfig.debug, "LOCAL TIMEOUT!");
                     }
                     else if (elapsedTimeValid >= gConfig.failsafeTimeout)
                     {
                         // No data for 5s - Failsafe
                         // std::cerr << "FAILSAFE_TIMEOUT\n";
                         crsfChannels[10] = fsMode ? US_TO_CRSF(1500) : US_TO_CRSF(2000);
-                        if (gConfig.debug)
-                            printf("FS TIMEOUT! - %s", fsMode ? "LAND\n" : "GPS\n");
+                        char buf[64];
+                        int n = snprintf(buf, sizeof(buf), "FS TIMEOUT! - %s", fsMode ? "LAND" : "GPS");
+                        Log(gConfig.debug, buf, n);
                     }
                     else if (elapsedTimeValid >= gConfig.stabTimeout)
                     {
@@ -253,8 +255,7 @@ int main()
                         crsfChannels[2] = US_TO_CRSF(gConfig.hoverValue); // THROTTLE
                         crsfChannels[3] = CRSF_CHANNEL_VALUE_MID;         // YAW
                         crsfChannels[5] = CRSF_CHANNEL_VALUE_MIN;         // ANGLE MODE MODE
-                        if (gConfig.debug)
-                            printf("STAB TIMEOUT!\n");
+                        Log(gConfig.debug, "STAB TIMEOUT!");
                     }
                     auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastSentPayload).count();
                     if (elapsedTime > 10)
@@ -295,18 +296,19 @@ int main()
                 }
                 else
                 {
-                    perror("Error");
+                    Log(gConfig.debug, "Error");
                     usleep(100000);
                 }
             }
             else if (bytesRead == 0)
             {
-                std::cout << "Connection closed by the server" << std::endl;
+                Log(gConfig.debug, "Connection closed by the server");
                 usleep(100000);
             }
             else if (bytesRead > 0)
             {
                 rxBuffer[bytesRead] = '\0';
+                Log(gConfig.debug, rxBuffer, bytesRead);
                 std::string strRegexpattern = "^CTL";
                 for (size_t i = 0; i < gConfig.rcChannels + 3; i++) // Length + N + RC channels + CRC16
                     strRegexpattern += ",(-?\\d+)";
@@ -319,7 +321,7 @@ int main()
                     size_t payloadLength = std::stol(matches[1]); // N + RC channels
                     if (payloadLength != gConfig.rcChannels + 1)
                         continue;
-
+                    // TODO: optimise for stack
                     uint16_t* payload = new uint16_t[payloadLength];
                     payload[0] = std::stoi(matches[2]) & 0xFFFF;
                     for (int i = 1; i <= gConfig.rcChannels; i++) // Populate payload with rc channels
@@ -330,7 +332,10 @@ int main()
                     // printf("CRC16: recv=%d calc=%d\n", crcRecv, crcCalc);
                     if (crcRecv != crcCalc)
                     {
-                        printf("CRC16 missmatch: recv=%d calc=%d\n", crcRecv, crcCalc);
+                        char buf[64];
+                        int n = snprintf(buf, sizeof(buf), "CRC16 missmatch: recv=%d calc=%d", crcRecv, crcCalc);
+                        Log(gConfig.debug, buf, n);
+                        delete[] payload;
                         continue;
                     }
 

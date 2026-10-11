@@ -1,5 +1,12 @@
 #include "utils.h"
 #include "config.h"
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <fcntl.h>
+#include <mntent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 Config config;
 
@@ -51,6 +58,7 @@ bool Config::readConfig(const std::string& filename)
                 serialPort = value;
             else if (key == "DEBUG")
                 debug = std::stoi(value);
+                // debug 0: off, 1: console, 2+: file (opened on the first log)
         }
     }
     return true;
@@ -251,4 +259,129 @@ uint8_t CRC8(const uint8_t* data, size_t start, size_t length)
     }
 
     return crc;
+}
+
+static int gFd = -1;
+static size_t gSize = 0;
+static char gPath[64];
+
+// True if LOG_DIR is a mount point and is mounted read-write
+static bool logDirWritable()
+{
+    FILE* mounts = setmntent("/proc/mounts", "r");
+    if (!mounts)
+        return false;
+    bool writable = false;
+    struct mntent* m;
+    while ((m = getmntent(mounts)) != nullptr)
+    {
+        if (strcmp(m->mnt_dir, LOG_DIR) == 0)
+            writable = hasmntopt(m, "rw") != nullptr; // last match wins (remounts stack)
+    }
+    endmntent(mounts);
+    return writable && access(LOG_DIR, W_OK) == 0;
+}
+
+static bool openFile(int extraFlags)
+{
+    gFd = open(gPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | extraFlags, 0644);
+    if (gFd < 0)
+        return false;
+    struct stat st;
+    gSize = fstat(gFd, &st) == 0 ? st.st_size : 0;
+    return true;
+}
+
+static void openLogFile()
+{
+    if (!logDirWritable())
+    {
+        printf("Log file disabled: " LOG_DIR " not mounted rw\n");
+        return;
+    }
+
+    time_t now = time(nullptr);
+    struct tm t;
+    localtime_r(&now, &t);
+    char stamp[32];
+    strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &t);
+    snprintf(gPath, sizeof(gPath), LOG_DIR "/masina_%s.log", stamp);
+    if (!openFile(0))
+    {
+        perror("Failed to open log file");
+        return;
+    }
+    printf("Logging to %s\n", gPath);
+}
+
+void Log(uint8_t mode, const char* msg, size_t len)
+{
+    if (!mode)
+        return;
+
+    // Strip trailing line endings; a single '\n' is appended
+    while (len > 0 && (msg[len - 1] == '\n' || msg[len - 1] == '\r'))
+        len--;
+
+    if (mode == 1)
+    {
+        fwrite(msg, 1, len, stdout);
+        fputc('\n', stdout);
+        return;
+    }
+
+    static bool openTried = false;
+    if (!openTried)
+    {
+        openTried = true;
+        openLogFile();
+    }
+    if (gFd < 0)
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    // localtime_r/strftime only when the second changes; milliseconds are formatted by hand
+    static time_t stampSec = -1;
+    static char stamp[20]; // YYYY-MM-DDTHH:MM:SS
+    static size_t stampLen = 0;
+    if (ts.tv_sec != stampSec)
+    {
+        stampSec = ts.tv_sec;
+        struct tm t;
+        localtime_r(&ts.tv_sec, &t);
+        stampLen = strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", &t);
+    }
+
+    char line[256];
+    memcpy(line, stamp, stampLen);
+    size_t n = stampLen;
+    unsigned ms = ts.tv_nsec / 1000000;
+    line[n++] = '.';
+    line[n++] = '0' + ms / 100;
+    line[n++] = '0' + ms / 10 % 10;
+    line[n++] = '0' + ms % 10;
+    line[n++] = ' ';
+
+    // Replace non-printable bytes so malformed input stays one line
+    for (size_t i = 0; i < len && n < sizeof(line) - 1; i++)
+    {
+        unsigned char c = msg[i];
+        line[n++] = (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+    line[n++] = '\n';
+
+    ssize_t written = write(gFd, line, n);
+    if (written > 0)
+        gSize += written;
+
+    if (gSize >= LOG_MAX_BYTES)
+    {
+        close(gFd);
+        char rotated[sizeof(gPath) + 2];
+        snprintf(rotated, sizeof(rotated), "%s.1", gPath);
+        rename(gPath, rotated);
+        openFile(O_TRUNC);
+    }
 }

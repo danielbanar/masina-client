@@ -17,6 +17,7 @@ fi
 
 # Run yaml-cli command
 yaml-cli -s .outgoing.server "udp://$GROUND_IP:2222"
+json_cli -s .outgoing.server '"udp://'"$GROUND_IP"':2222"' -i /etc/waybeam.json
 if [ $? -eq 0 ]; then
     echo "yaml-cli command executed successfully."
     exit 0
