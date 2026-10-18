@@ -19,11 +19,13 @@
  *   The key=value lines are also sent over UDP to GROUND_IP from /etc/masina.conf, port 2224 (same as the SSC
  *   telemetry from masinatelemetry; the ground tells them apart by the first field). With DEBUG=2 in masina.conf
  *   they are also appended to /mnt/mmcblk0p1/modem_link_<date>_<time>.log if the SD card is mounted rw.
+ *   A copy goes to 127.0.0.1:2225 for modem_alink (adaptive video bitrate); nothing happens if it isn't running.
  *
  * usage: modem_link [interval_s] [diag_port] [at_port] [--table]      Ctrl-C prints totals and exits
  */
 #include <mntent.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -97,15 +99,17 @@ static void kv_f(const char *k, int ok, double v, int prec, const char *unit)
 #define MASINA_CONF "/etc/masina.conf"
 #define GROUND_PORT "2224"
 #define LOG_DIR "/mnt/mmcblk0p1"
+#define ALINK_PORT 2225 /* modem_alink listens here on 127.0.0.1 */
 
 typedef struct {
     char ground_ip[128];
     int debug; /* 0 off, 1 console, 2+ file; only the file mode matters here */
 } masina_conf_t;
 
-static int udp_fd = -1, log_fd = -1;
+static int udp_fd = -1, log_fd = -1, alink_fd = -1;
 static struct sockaddr_storage udp_addr;
 static socklen_t udp_addrlen;
+static struct sockaddr_in alink_addr;
 
 /* the last occurrence of a key wins, as in Config::readConfig */
 static int conf_read(masina_conf_t *c)
@@ -141,6 +145,15 @@ static void udp_open(const char *host)
     memcpy(&udp_addr, res->ai_addr, res->ai_addrlen);
     udp_addrlen = res->ai_addrlen;
     freeaddrinfo(res);
+}
+
+/* local copy for modem_alink; sends to a port nobody listens on are dropped by the kernel */
+static void alink_open(void)
+{
+    alink_addr.sin_family = AF_INET;
+    alink_addr.sin_port = htons(ALINK_PORT);
+    alink_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    alink_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 }
 
 /* true if LOG_DIR is a mount point mounted read-write (same check as Log() in utils.cpp) */
@@ -187,6 +200,10 @@ static void kv_end(void)
     if (udp_fd >= 0) {
         struct msghdr msg = { .msg_name = &udp_addr, .msg_namelen = udp_addrlen, .msg_iov = iov, .msg_iovlen = 2 };
         sendmsg(udp_fd, &msg, 0);
+    }
+    if (alink_fd >= 0) {
+        struct msghdr msg = { .msg_name = &alink_addr, .msg_namelen = sizeof(alink_addr), .msg_iov = iov, .msg_iovlen = 2 };
+        sendmsg(alink_fd, &msg, 0);
     }
     if (log_fd >= 0 && writev(log_fd, iov, 2) < 0) {
         /* card removed or full: stop logging instead of failing on every line */
@@ -270,6 +287,8 @@ int main(int argc, char **argv)
     static health_t hl;
     health_open(&hl, args[2]);
     static masina_conf_t conf;
+    if (!table)
+        alink_open();
     if (!table && conf_read(&conf)) {
         udp_open(conf.ground_ip);
         if (conf.debug >= 2)

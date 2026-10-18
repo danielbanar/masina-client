@@ -6,7 +6,7 @@ CFLAGS = $(CXXFLAGS)
 # lte_common.c is optional, the helpers may live entirely in lte_common.h
 MODEM_SRCS = modem_link.c $(wildcard lte_common.c)
 
-TARGETS = masinaclient masinatelemetry modem_link
+TARGETS = masinaclient masinatelemetry modem_link modem_alink
 
 all: $(TARGETS)
 
@@ -18,6 +18,9 @@ masinatelemetry: telemetry.cpp utils.cpp
 
 modem_link: $(MODEM_SRCS) lte_common.h
 	$(CC) $(CFLAGS) $(MODEM_SRCS) -o $@ -lm -Wl,--gc-sections
+
+modem_alink: modem_alink.c
+	$(CC) $(CFLAGS) modem_alink.c -o $@ -Wl,--gc-sections
 
 clean:
 	rm -f $(TARGETS)
