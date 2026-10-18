@@ -17,10 +17,12 @@
  * Output: one line per interval, "SIM7600G-H;name=value<unit>;...", fields always in the same order, NA = no data.
  *   Event lines: ...;event=cell_change;... and on exit ...;event=summary;...   --table prints the old column view.
  *   The key=value lines are also sent over UDP to GROUND_IP from /etc/masina.conf, port 2224 (same as the SSC
- *   telemetry from masinatelemetry; the ground tells them apart by the first field).
+ *   telemetry from masinatelemetry; the ground tells them apart by the first field). With DEBUG=2 in masina.conf
+ *   they are also appended to /mnt/mmcblk0p1/modem_link_<date>_<time>.log if the SD card is mounted rw.
  *
  * usage: modem_link [interval_s] [diag_port] [at_port] [--table]      Ctrl-C prints totals and exits
  */
+#include <mntent.h>
 #include <netdb.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -90,26 +92,41 @@ static void kv_f(const char *k, int ok, double v, int prec, const char *unit)
     kv_s(k, b);
 }
 
-/* ---- UDP copy of the key=value lines to the ground station */
+/* ---- outputs besides stdout, configured from /etc/masina.conf like the other masina binaries:
+ *      UDP copy to GROUND_IP:2224 and, with DEBUG=2, a log file on the SD card */
 #define MASINA_CONF "/etc/masina.conf"
 #define GROUND_PORT "2224"
+#define LOG_DIR "/mnt/mmcblk0p1"
 
-static int udp_fd = -1;
+typedef struct {
+    char ground_ip[128];
+    int debug; /* 0 off, 1 console, 2+ file; only the file mode matters here */
+} masina_conf_t;
+
+static int udp_fd = -1, log_fd = -1;
 static struct sockaddr_storage udp_addr;
 static socklen_t udp_addrlen;
 
-/* GROUND_IP from masina.conf (IP or hostname); without it the lines only go to stdout */
-static void udp_open(void)
+/* the last occurrence of a key wins, as in Config::readConfig */
+static int conf_read(masina_conf_t *c)
 {
     FILE *f = fopen(MASINA_CONF, "r");
     if (!f) {
         fprintf(stderr, "warning: %s not found, UDP output disabled\n", MASINA_CONF);
-        return;
+        return 0;
     }
-    char buf[256], host[128] = "";
-    while (fgets(buf, sizeof(buf), f))
-        if (sscanf(buf, "GROUND_IP=%127s", host) == 1) break;
+    char buf[256];
+    while (fgets(buf, sizeof(buf), f)) {
+        sscanf(buf, "GROUND_IP=%127s", c->ground_ip);
+        sscanf(buf, "DEBUG=%d", &c->debug);
+    }
     fclose(f);
+    return 1;
+}
+
+/* GROUND_IP may be an IP or a hostname; without it the lines only go to stdout */
+static void udp_open(const char *host)
+{
     if (!*host) {
         fprintf(stderr, "warning: no GROUND_IP in %s, UDP output disabled\n", MASINA_CONF);
         return;
@@ -126,15 +143,56 @@ static void udp_open(void)
     freeaddrinfo(res);
 }
 
+/* true if LOG_DIR is a mount point mounted read-write (same check as Log() in utils.cpp) */
+static int log_dir_writable(void)
+{
+    FILE *mounts = setmntent("/proc/mounts", "r");
+    if (!mounts)
+        return 0;
+    int writable = 0;
+    struct mntent *m;
+    while ((m = getmntent(mounts)) != NULL)
+        if (!strcmp(m->mnt_dir, LOG_DIR))
+            writable = hasmntopt(m, "rw") != NULL; /* last match wins (remounts stack) */
+    endmntent(mounts);
+    return writable && access(LOG_DIR, W_OK) == 0;
+}
+
+/* LOG_DIR/modem_link_<date>_<time>.log, a new file per start; never truncated or rotated */
+static void log_open(void)
+{
+    if (!log_dir_writable()) {
+        fprintf(stderr, "Log file disabled: " LOG_DIR " not mounted rw\n");
+        return;
+    }
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    char stamp[32], path[96];
+    strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
+    snprintf(path, sizeof(path), LOG_DIR "/modem_link_%s.log", stamp);
+    log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (log_fd < 0)
+        perror(path);
+    else
+        fprintf(stderr, "Logging to %s\n", path);
+}
+
 static void kv_end(void)
 {
     puts(line);
     fflush(stdout);
+    /* newline-terminated like the SSC lines: one datagram and one write per line */
+    struct iovec iov[2] = { { line, strlen(line) }, { "\n", 1 } };
     if (udp_fd >= 0) {
-        /* one datagram per line, newline-terminated like the SSC lines */
-        struct iovec iov[2] = { { line, strlen(line) }, { "\n", 1 } };
         struct msghdr msg = { .msg_name = &udp_addr, .msg_namelen = udp_addrlen, .msg_iov = iov, .msg_iovlen = 2 };
         sendmsg(udp_fd, &msg, 0);
+    }
+    if (log_fd >= 0 && writev(log_fd, iov, 2) < 0) {
+        /* card removed or full: stop logging instead of failing on every line */
+        perror("log write");
+        close(log_fd);
+        log_fd = -1;
     }
 }
 
@@ -211,8 +269,12 @@ int main(int argc, char **argv)
 
     static health_t hl;
     health_open(&hl, args[2]);
-    if (!table)
-        udp_open();
+    static masina_conf_t conf;
+    if (!table && conf_read(&conf)) {
+        udp_open(conf.ground_ip);
+        if (conf.debug >= 2)
+            log_open();
+    }
     int seen_t = 0, seen_v = 0, tmin = 0, tmax = 0;
     double vmin = 0, vmax = 0;
 
