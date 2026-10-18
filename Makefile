@@ -1,13 +1,15 @@
 CXX = arm-linux-gnueabihf-g++
 CXXFLAGS = -march=armv7-a -mfpu=neon -mfloat-abi=hard -O2 -flto -fdata-sections -ffunction-sections -mtune=cortex-a9
-PTHREAD = -pthread
 
-TARGETS = masinaclient at_command
+TARGETS = masinaclient masinatelemetry at_command
 
 all: $(TARGETS)
 
 masinaclient: client.cpp utils.cpp
-	$(CXX) $(CXXFLAGS) client.cpp utils.cpp -o $@ $(PTHREAD) -Wl,--gc-sections
+	$(CXX) $(CXXFLAGS) client.cpp utils.cpp -o $@ -Wl,--gc-sections
+
+masinatelemetry: telemetry.cpp utils.cpp
+	$(CXX) $(CXXFLAGS) telemetry.cpp utils.cpp -o $@ -Wl,--gc-sections
 
 at_command: at_command.cpp
 	$(CXX) $(CXXFLAGS) at_command.cpp -o $@ -Wl,--gc-sections

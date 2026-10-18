@@ -1,10 +1,13 @@
 #include "utils.h"
 #include "config.h"
+#include <arpa/inet.h>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
 #include <mntent.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 Config config;
@@ -63,83 +66,101 @@ bool Config::readConfig(const std::string& filename)
     return true;
 }
 
-struct NetworkUsage
+int initializeSocket(const std::string& address, int port, struct sockaddr_in& serverAddr)
 {
-    unsigned long rxBytes;
-    unsigned long txBytes;
-};
+    int sockfd;
+    struct addrinfo hints, *res;
+
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+    {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    memset(&hints, 0, sizeof(hints));
+
+    hints.ai_family = AF_INET;      // IPv4
+    hints.ai_socktype = SOCK_DGRAM; // UDP
+
+    // Check if the input is an IP address
+    if (inet_pton(AF_INET, address.c_str(), &serverAddr.sin_addr) == 1)
+    {
+        // It's an IP address
+        serverAddr.sin_family = AF_INET;
+    }
+    else
+    {
+        // It's a hostname, resolve it
+        if (getaddrinfo(address.c_str(), NULL, &hints, &res) != 0)
+        {
+            perror("getaddrinfo failed");
+            exit(EXIT_FAILURE);
+        }
+
+        // Copy the resolved address to serverAddr
+        serverAddr = *(struct sockaddr_in*)(res->ai_addr);
+        freeaddrinfo(res);
+    }
+
+    serverAddr.sin_port = htons(port);
+
+    // Set socket to non-blocking
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+
+    return sockfd;
+}
+
+// Reads a single unsigned number from a sysfs file
+static bool readU64(const char* path, uint64_t& value)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return false;
+    buf[n] = '\0';
+    value = strtoull(buf, nullptr, 10);
+    return true;
+}
 
 NetworkUsage getNetworkUsage()
 {
-    std::ifstream netDevFile("/proc/net/dev");
-    std::string line;
     NetworkUsage usage = {0, 0};
-
-    // Skip the first two lines (header lines)
-    std::getline(netDevFile, line);
-    std::getline(netDevFile, line);
-
-    while (std::getline(netDevFile, line))
+    for (const char* iface : {"usb0", "wwan0"})
     {
-        std::istringstream iss(line);
-        std::string iface;
-        iss >> iface;
-
-        // Remove trailing colon from the interface name
-        if (!iface.empty() && iface.back() == ':')
-            iface.pop_back();
-
-        if (iface == "usb0" || iface == "wwan0")
-        {
-            unsigned long rx_bytes, dummy, tx_bytes;
-
-            iss >> rx_bytes; // receive bytes
-
-            // Skip the next 7 fields (packets, errs, drop, fifo, frame, compressed, multicast)
-            for (int i = 0; i < 7; ++i)
-                iss >> dummy;
-
-            iss >> tx_bytes; // transmit bytes
-
-            usage.rxBytes = rx_bytes;
-            usage.txBytes = tx_bytes;
-            break;
-        }
+        char path[64];
+        snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/rx_bytes", iface);
+        if (!readU64(path, usage.rxBytes))
+            continue;
+        snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/tx_bytes", iface);
+        readU64(path, usage.txBytes);
+        break;
     }
-
     return usage;
 }
 
 int getCpuTemperature()
 {
-    std::ifstream file("/sys/devices/virtual/mstar/msys/TEMP_R");
-    if (!file.is_open())
-    {
-        std::cerr << "Error: Unable to open temperature file." << std::endl;
+    int fd = open("/sys/devices/virtual/mstar/msys/TEMP_R", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
         return -1;
-    }
-
-    std::string line;
-    std::getline(file, line);
-    file.close();
-
-    size_t pos = line.find("Temperature ");
-    if (pos == std::string::npos)
-    {
-        std::cerr << "Error: Unexpected file format." << std::endl;
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
         return -1;
-    }
+    buf[n] = '\0';
 
-    try
-    {
-        int temperature = std::stoi(line.substr(pos + 12)); // Extract temperature after "Temperature "
-        return temperature;
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << "Error: Failed to parse temperature: " << e.what() << std::endl;
+    // Expected format: "Temperature 45"
+    const char* pos = strstr(buf, "Temperature ");
+    if (!pos)
         return -1;
-    }
+    return atoi(pos + 12);
 }
 
 void getSignalStrength(int& rssi, int& snr)

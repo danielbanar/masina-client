@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <regex>
+#include <netinet/in.h>
 
 #define CRSF_CHANNEL_VALUE_MIN 172
 #define CRSF_CHANNEL_VALUE_1000 191
@@ -17,7 +18,14 @@
 #define CRSF_CHANNEL_VALUE_2000 1792
 #define CRSF_CHANNEL_VALUE_MAX 1811
 
-struct NetworkUsage;
+// Interface byte counters; 64-bit because the kernel counters pass 4 GiB
+struct NetworkUsage
+{
+    uint64_t rxBytes;
+    uint64_t txBytes;
+};
+
+int initializeSocket(const std::string& address, int port, struct sockaddr_in& serverAddr);
 NetworkUsage getNetworkUsage();
 int getCpuTemperature();
 void getSignalStrength(int& rssi, int& snr);

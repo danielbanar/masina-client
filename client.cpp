@@ -2,7 +2,6 @@
 #include "/usr/include/asm-generic/termbits.h"
 #include "config.h"
 #include "utils.h"
-#include <arpa/inet.h>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -12,7 +11,6 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <regex>
 #include <stdio.h>
@@ -20,118 +18,13 @@
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
 Config gConfig;
 
-#define BUFFER_SIZE 128
 #define RADTODEG(radians) ((radians) * (180.0 / M_PI))
 #define US_TO_CRSF(value) ((value - 1000) * (1792 - 191) / (2000 - 1000) + 191)
-
-struct NetworkUsage
-{
-    unsigned long rxBytes;
-    unsigned long txBytes;
-};
-
-int initializeSocket(const std::string& address, int port, struct sockaddr_in& serverAddr)
-{
-    int sockfd;
-    struct addrinfo hints, *res;
-
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
-    {
-        perror("Socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    memset(&serverAddr, 0, sizeof(serverAddr));
-    memset(&hints, 0, sizeof(hints));
-
-    hints.ai_family = AF_INET;      // IPv4
-    hints.ai_socktype = SOCK_DGRAM; // UDP
-
-    // Check if the input is an IP address
-    if (inet_pton(AF_INET, address.c_str(), &serverAddr.sin_addr) == 1)
-    {
-        // It's an IP address
-        serverAddr.sin_family = AF_INET;
-    }
-    else
-    {
-        // It's a hostname, resolve it
-        if (getaddrinfo(address.c_str(), NULL, &hints, &res) != 0)
-        {
-            perror("getaddrinfo failed");
-            exit(EXIT_FAILURE);
-        }
-
-        // Copy the resolved address to serverAddr
-        serverAddr = *(struct sockaddr_in*)(res->ai_addr);
-        freeaddrinfo(res);
-    }
-
-    serverAddr.sin_port = htons(port);
-
-    // Set socket to non-blocking
-    int flags = fcntl(sockfd, F_GETFL, 0);
-    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-
-    return sockfd;
-}
-
-void receiveMessages(int sockfd, struct sockaddr_in& serverAddr)
-{
-    char buffer[BUFFER_SIZE];
-    socklen_t addrLen = sizeof(serverAddr);
-
-    while (true)
-    {
-        usleep(1000);
-        int len = recvfrom(sockfd, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&serverAddr, &addrLen);
-        if (len == -1)
-        {
-        }
-        if (len > 0)
-        {
-            buffer[len] = '\0';
-            std::cout << "Received: " << buffer;
-        }
-    }
-}
-void PiTelemetry()
-{
-    struct sockaddr_in serverAddr;
-    int sockfd = initializeSocket(gConfig.groundIP, 2224, serverAddr);
-
-    std::thread receiveThread(receiveMessages, sockfd, std::ref(serverAddr));
-
-    while (true)
-    {
-        const double interval = 0.5; // interval in seconds
-        const double bytes_to_kb = 1024.0;
-        NetworkUsage usage1 = getNetworkUsage();
-        std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(interval * 1000)));
-        NetworkUsage usage2 = getNetworkUsage();
-        unsigned long rx_diff = usage2.rxBytes - usage1.rxBytes;
-        unsigned long tx_diff = usage2.txBytes - usage1.txBytes;
-        unsigned long rx_kbps = static_cast<unsigned long>(rx_diff / bytes_to_kb / interval);
-        unsigned long tx_kbps = static_cast<unsigned long>(tx_diff / bytes_to_kb / interval);
-        int rssi = 0;
-        int snr = 0;
-        std::string telemetryString = "Temp: " + std::to_string(getCpuTemperature()) + " C, R: " + std::to_string(rx_kbps) +
-                                      " KB/s, T: " + std::to_string(tx_kbps) + " KB/s, RSSI: " + std::to_string(rssi) + ", SNR: " + std::to_string(snr) +
-                                      "\n\0";
-        sendto(sockfd, telemetryString.c_str(), telemetryString.length(), 0, (const struct sockaddr*)&serverAddr, sizeof(serverAddr));
-        telemetryString = getServingCellInfo();
-        sendto(sockfd, telemetryString.c_str(), telemetryString.length(), 0, (const struct sockaddr*)&serverAddr, sizeof(serverAddr));
-    }
-
-    receiveThread.join();
-    close(sockfd);
-}
 
 int main()
 {
@@ -139,8 +32,6 @@ int main()
         return 1;
 
     gConfig.print();
-
-    std::thread PiTelemetryThread(PiTelemetry);
 
     int serialPort = open(gConfig.serialPort.c_str(), O_RDWR);
     int baudrate = 420000;
@@ -389,6 +280,5 @@ int main()
     }
     close(sockfd);
     close(serialPort);
-    PiTelemetryThread.join();
     return 0;
 }
