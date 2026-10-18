@@ -1,8 +1,8 @@
 #!/bin/sh
 
-DAEMON="lte_link"
+DAEMON="modem_link"
 PIDFILE="/var/run/$DAEMON.pid"
-DAEMON_ARGS=""
+DAEMON_ARGS="0.25"
 
 if [ -e /etc/masina.conf ]; then
 	. /etc/masina.conf
@@ -10,7 +10,7 @@ fi
 
 start() {
 	if [ "$enabled" = "true" ]; then
-		echo -n "Starting modem telemetry..."
+		echo -n "Starting modem link..."
 		start-stop-daemon -b -m -S -q -p "$PIDFILE" -x "$DAEMON" -- $DAEMON_ARGS
 		if [ $? -eq 0 ]; then
 			echo "OK"
@@ -18,13 +18,13 @@ start() {
 			echo "FAIL"
 		fi
 	else
-		echo "Modem telemetry is disabled in /etc/masina.conf"
+		echo "Modem link is disabled in /etc/masina.conf"
 		exit 1
 	fi
 }
 
 stop() {
-	echo -n "Stopping modem telemetry: "
+	echo -n "Stopping modem link: "
 	start-stop-daemon -K -q -p "$PIDFILE"
 	if [ $? -eq 0 ]; then
 		rm -f "$PIDFILE"

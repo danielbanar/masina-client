@@ -16,10 +16,15 @@
  *
  * Output: one line per interval, "SIM7600G-H;name=value<unit>;...", fields always in the same order, NA = no data.
  *   Event lines: ...;event=cell_change;... and on exit ...;event=summary;...   --table prints the old column view.
+ *   The key=value lines are also sent over UDP to GROUND_IP from /etc/masina.conf, port 2224 (same as the SSC
+ *   telemetry from masinatelemetry; the ground tells them apart by the first field).
  *
- * usage: lte_link [interval_s] [diag_port] [at_port] [--table]      Ctrl-C prints totals and exits
+ * usage: modem_link [interval_s] [diag_port] [at_port] [--table]      Ctrl-C prints totals and exits
  */
+#include <netdb.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include "lte_common.h"
 
 static volatile sig_atomic_t stop;
@@ -85,7 +90,53 @@ static void kv_f(const char *k, int ok, double v, int prec, const char *unit)
     kv_s(k, b);
 }
 
-static void kv_end(void) { puts(line); fflush(stdout); }
+/* ---- UDP copy of the key=value lines to the ground station */
+#define MASINA_CONF "/etc/masina.conf"
+#define GROUND_PORT "2224"
+
+static int udp_fd = -1;
+static struct sockaddr_storage udp_addr;
+static socklen_t udp_addrlen;
+
+/* GROUND_IP from masina.conf (IP or hostname); without it the lines only go to stdout */
+static void udp_open(void)
+{
+    FILE *f = fopen(MASINA_CONF, "r");
+    if (!f) {
+        fprintf(stderr, "warning: %s not found, UDP output disabled\n", MASINA_CONF);
+        return;
+    }
+    char buf[256], host[128] = "";
+    while (fgets(buf, sizeof(buf), f))
+        if (sscanf(buf, "GROUND_IP=%127s", host) == 1) break;
+    fclose(f);
+    if (!*host) {
+        fprintf(stderr, "warning: no GROUND_IP in %s, UDP output disabled\n", MASINA_CONF);
+        return;
+    }
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res;
+    if (getaddrinfo(host, GROUND_PORT, &hints, &res) != 0) {
+        fprintf(stderr, "warning: cannot resolve GROUND_IP %s, UDP output disabled\n", host);
+        return;
+    }
+    /* non-blocking: a dead link must never stall the DIAG loop */
+    udp_fd = socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    memcpy(&udp_addr, res->ai_addr, res->ai_addrlen);
+    udp_addrlen = res->ai_addrlen;
+    freeaddrinfo(res);
+}
+
+static void kv_end(void)
+{
+    puts(line);
+    fflush(stdout);
+    if (udp_fd >= 0) {
+        /* one datagram per line, newline-terminated like the SSC lines */
+        struct iovec iov[2] = { { line, strlen(line) }, { "\n", 1 } };
+        struct msghdr msg = { .msg_name = &udp_addr, .msg_namelen = udp_addrlen, .msg_iov = iov, .msg_iovlen = 2 };
+        sendmsg(udp_fd, &msg, 0);
+    }
+}
 
 static void health_poll(health_t *h)
 {
@@ -160,6 +211,8 @@ int main(int argc, char **argv)
 
     static health_t hl;
     health_open(&hl, args[2]);
+    if (!table)
+        udp_open();
     int seen_t = 0, seen_v = 0, tmin = 0, tmax = 0;
     double vmin = 0, vmax = 0;
 
@@ -194,9 +247,16 @@ int main(int argc, char **argv)
         if (s.rf_valid && have_cell && ((int)s.earfcn != cell_e || s.pci != cell_p)) {
             if (table)
                 printf("*** cell change: EARFCN/PCI %d/%d -> %u/%d\n", cell_e, cell_p, s.earfcn, s.pci);
-            else
-                printf("%s;time=%s;event=cell_change;earfcn_old=%d;pci_old=%d;earfcn=%u;pci=%d\n", hl.model, tm, cell_e,
-                       cell_p, s.earfcn, s.pci);
+            else {
+                kv_start(hl.model);
+                kv_s("time", tm);
+                kv_s("event", "cell_change");
+                kv_l("earfcn_old", cell_e);
+                kv_l("pci_old", cell_p);
+                kv_l("earfcn", (long)s.earfcn);
+                kv_l("pci", s.pci);
+                kv_end();
+            }
         }
         if (s.rf_valid) { have_cell = 1; cell_e = s.earfcn; cell_p = s.pci; }
 

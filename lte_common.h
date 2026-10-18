@@ -1,4 +1,4 @@
-/* Shared code for lte_link / lte_info: Qualcomm DIAG transport, AT commands and
+/* Shared code for modem_link / lte_info: Qualcomm DIAG transport, AT commands and
  * PHY/MAC log parsers for SIM7600 (MDM9x07). Plain C99 + POSIX, no dependencies. */
 #ifndef LTE_COMMON_H
 #define LTE_COMMON_H
