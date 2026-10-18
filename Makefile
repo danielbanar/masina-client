@@ -1,7 +1,12 @@
+CC = arm-linux-gnueabihf-gcc
 CXX = arm-linux-gnueabihf-g++
 CXXFLAGS = -march=armv7-a -mfpu=neon -mfloat-abi=hard -O2 -flto -fdata-sections -ffunction-sections -mtune=cortex-a9
+CFLAGS = $(CXXFLAGS)
 
-TARGETS = masinaclient masinatelemetry at_command
+# lte_common.c is optional, the helpers may live entirely in lte_common.h
+LTE_SRCS = lte_link.c $(wildcard lte_common.c)
+
+TARGETS = masinaclient masinatelemetry lte_link
 
 all: $(TARGETS)
 
@@ -11,8 +16,8 @@ masinaclient: client.cpp utils.cpp
 masinatelemetry: telemetry.cpp utils.cpp
 	$(CXX) $(CXXFLAGS) telemetry.cpp utils.cpp -o $@ -Wl,--gc-sections
 
-at_command: at_command.cpp
-	$(CXX) $(CXXFLAGS) at_command.cpp -o $@ -Wl,--gc-sections
+lte_link: $(LTE_SRCS) lte_common.h
+	$(CC) $(CFLAGS) $(LTE_SRCS) -o $@ -lm -Wl,--gc-sections
 
 clean:
 	rm -f $(TARGETS)

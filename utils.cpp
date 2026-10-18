@@ -112,18 +112,26 @@ int initializeSocket(const std::string& address, int port, struct sockaddr_in& s
     return sockfd;
 }
 
-// Reads a single unsigned number from a sysfs file
-static bool readU64(const char* path, uint64_t& value)
+// Reads up to size - 1 bytes of a small proc/sysfs file and null-terminates it; returns the length or -1
+static ssize_t readFile(const char* path, char* buf, size_t size)
 {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
-        return false;
-    char buf[32];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        return -1;
+    ssize_t n = read(fd, buf, size - 1);
     close(fd);
-    if (n <= 0)
-        return false;
+    if (n < 0)
+        return -1;
     buf[n] = '\0';
+    return n;
+}
+
+// Reads a single unsigned number from a sysfs file
+static bool readU64(const char* path, uint64_t& value)
+{
+    char buf[32];
+    if (readFile(path, buf, sizeof(buf)) <= 0)
+        return false;
     value = strtoull(buf, nullptr, 10);
     return true;
 }
@@ -146,21 +154,93 @@ NetworkUsage getNetworkUsage()
 
 int getCpuTemperature()
 {
-    int fd = open("/sys/devices/virtual/mstar/msys/TEMP_R", O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
     char buf[128];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0)
+    if (readFile("/sys/devices/virtual/mstar/msys/TEMP_R", buf, sizeof(buf)) <= 0)
         return -1;
-    buf[n] = '\0';
 
     // Expected format: "Temperature 45"
     const char* pos = strstr(buf, "Temperature ");
     if (!pos)
         return -1;
     return atoi(pos + 12);
+}
+
+void getCpuTimes(CpuTimes* cores, int maxCores)
+{
+    for (int i = 0; i < maxCores; i++)
+        cores[i] = {0, 0, false};
+
+    // The aggregate "cpu" line and the per-core lines come first; offline cores are not listed
+    char buf[512];
+    if (readFile("/proc/stat", buf, sizeof(buf)) <= 0)
+        return;
+
+    // Only complete lines are parsed, the buffer may end mid-line
+    char* line = buf;
+    char* end;
+    while ((end = strchr(line, '\n')) != nullptr)
+    {
+        *end = '\0';
+        // cpuN user nice system idle iowait irq softirq steal
+        int id;
+        unsigned long long v[8] = {0};
+        if (strncmp(line, "cpu", 3) == 0 && line[3] >= '0' && line[3] <= '9' &&
+            sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu", &id, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) >= 5 &&
+            id < maxCores)
+        {
+            for (int i = 0; i < 8; i++)
+                cores[id].total += v[i];
+            cores[id].idle = v[3] + v[4]; // idle + iowait
+            cores[id].present = true;
+        }
+        line = end + 1;
+    }
+}
+
+MemoryUsage getMemoryUsage()
+{
+    MemoryUsage mem = {0, 0};
+    // MemTotal, MemFree, MemAvailable, Buffers and Cached are the first lines
+    char buf[256];
+    if (readFile("/proc/meminfo", buf, sizeof(buf)) <= 0)
+        return mem;
+
+    unsigned long totalKB = 0, freeKB = 0, availableKB = 0, buffersKB = 0, cachedKB = 0;
+    bool hasAvailable = false;
+    char* line = buf;
+    char* end;
+    while ((end = strchr(line, '\n')) != nullptr)
+    {
+        *end = '\0';
+        char key[32];
+        unsigned long kb;
+        if (sscanf(line, "%31[^:]: %lu", key, &kb) == 2)
+        {
+            if (strcmp(key, "MemTotal") == 0)
+                totalKB = kb;
+            else if (strcmp(key, "MemFree") == 0)
+                freeKB = kb;
+            else if (strcmp(key, "MemAvailable") == 0)
+            {
+                availableKB = kb;
+                hasAvailable = true;
+            }
+            else if (strcmp(key, "Buffers") == 0)
+                buffersKB = kb;
+            else if (strcmp(key, "Cached") == 0)
+                cachedKB = kb;
+        }
+        line = end + 1;
+    }
+
+    // Kernels before 3.14 have no MemAvailable; free + page cache is the usual estimate
+    if (!hasAvailable)
+        availableKB = freeKB + buffersKB + cachedKB;
+    if (availableKB > totalKB)
+        availableKB = totalKB;
+    mem.usedMB = (totalKB - availableKB) / 1024;
+    mem.totalMB = totalKB / 1024;
+    return mem;
 }
 
 void getSignalStrength(int& rssi, int& snr)
@@ -211,34 +291,6 @@ void getSignalStrength(int& rssi, int& snr)
         snr = -1;
     }
 }
-std::string getServingCellInfo()
-{
-    return "";
-    // Command to send AT command and read response from /dev/ttyUSB2
-    const char* command = "at_command";
-
-    // Open a pipe to execute the command
-    FILE* fp = popen(command, "r");
-    if (fp == nullptr)
-    {
-        std::cerr << "Failed to run command" << std::endl;
-        return "";
-    }
-
-    // Read the output of the command
-    char buffer[256];
-    std::string output;
-    while (fgets(buffer, sizeof(buffer), fp) != nullptr)
-    {
-        output += buffer;
-    }
-
-    // Close the pipe
-    pclose(fp);
-
-    return output;
-}
-
 int16_t CRC16(uint16_t* data, size_t length)
 {
     uint16_t crc = 0x0000;        // Initial value

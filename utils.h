@@ -25,11 +25,26 @@ struct NetworkUsage
     uint64_t txBytes;
 };
 
+// Cumulative CPU time of one core in jiffies from /proc/stat; usage is the busy share of the difference between two samples
+struct CpuTimes
+{
+    uint64_t total;
+    uint64_t idle;
+    bool present; // listed in /proc/stat, i.e. the core exists and is online
+};
+
+struct MemoryUsage
+{
+    uint32_t usedMB; // MemTotal - MemAvailable, so reclaimable page cache is not counted
+    uint32_t totalMB;
+};
+
 int initializeSocket(const std::string& address, int port, struct sockaddr_in& serverAddr);
 NetworkUsage getNetworkUsage();
 int getCpuTemperature();
+void getCpuTimes(CpuTimes* cores, int maxCores);
+MemoryUsage getMemoryUsage();
 void getSignalStrength(int& rssi, int& snr);
-std::string getServingCellInfo() ;
 int16_t CRC16(uint16_t* data, size_t length);
 uint8_t CRC8(const uint8_t* data, size_t start, size_t length);
 
