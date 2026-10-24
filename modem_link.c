@@ -1,4 +1,9 @@
-/* Live LTE link-quality monitor for SIM7600 / Quectel EC25 (Qualcomm MDM9x07) over DIAG (/dev/ttyUSB0).
+/* Live LTE link-quality monitor for SIM7600 / Quectel EC25 (Qualcomm MDM9x07) and Quectel EP06 over DIAG (/dev/ttyUSB0).
+ *
+ * The EP06 logs newer packet versions; decoded from checks against AT+QRSRP / AT+QENG and uploads at known rates:
+ * serving cell v22, PUSCH v102 (code rate worked out from TB size), MAC UL TB v2, UL buffer v24, PHICH v25, PUSCH
+ * power v25, UL grants v2, CQI / RI v101 (main carrier), PDCP UL v24, PDSCH v24 (a record per carrier: dl_scc_rate is
+ * the secondary carrier's share of dl_rate, dl_mimo counts both). No RLC UL statistics (0xB097) are logged on it.
  *
  * Per interval prints:
  *   DL  (0xB173 PDSCH stat v5): scheduled TBs, first-tx BLER, HARQ retx, residual HARQ failures
@@ -22,6 +27,10 @@
  *       PDCP discards, increase over the interval (NA = no statistics packet in the interval, they come every ~1.3 s)
  *   Neighbours (0xB179 v4 intra-frequency, 0xB195 every measured frequency): count, strongest EARFCN/PCI/RSRP/RSRQ,
  *       handover margin = serving - best neighbour RSRP
+ *   Carrier aggregation (EP06): secondary cell EARFCN / PCI, RSRP / RSRQ from its serving cell measurement (0xB193
+ *       v22 cell index 1, while the cell is active), else the neighbour measurement of it, else Quectel AT+QCAINFO
+ *       (polled with the temperature, which also gives the SINR); secondary cells are left out of the neighbour
+ *       fields and the handover margin
  *   Trigger: the network's measurement rule closest to firing (trigger=A2 / A5@1875/3500/6400 ...), trigger_gap =
  *       dB the signal can still move before its condition holds (<= 0: holds), trigger_nb = the neighbour it
  *       compares (NA: not measured, a cell on another band is only measured during gaps), trigger_held = ms the
@@ -75,6 +84,8 @@ typedef struct {
     double volt, vmin, vmax;
     char model[64];
     int quectel;
+    int nscc;                          /* secondary cells (carrier aggregation) from Quectel AT+QCAINFO */
+    struct { unsigned earfcn; int pci; double rsrp, rsrq, sinr; } scc[4];
 } health_t;
 
 static void health_open(health_t *h, const char *port, diag_t *d)
@@ -112,6 +123,13 @@ static void kv_l(const char *k, long v)
     char b[32];
     snprintf(b, sizeof(b), "%ld", v);
     kv_s(k, b);
+}
+
+/* count, or NA when !ok */
+static void kv_lna(const char *k, int ok, long v)
+{
+    if (ok) kv_l(k, v);
+    else kv_s(k, "NA");
 }
 
 /* number with unit, or NA when !ok */
@@ -265,6 +283,47 @@ static void health_poll(health_t *h)
     }
     if (!ht) h->have_t = 0;
     if (!hv) h->have_v = 0;
+    if (h->quectel) {  /* carrier aggregation: +QCAINFO: "scc",<earfcn>,<RBs>,"LTE BAND 3",<state>,<pci>,<rsrp>,<rsrq>,<rssi>,<sinr> */
+        static at_lines L;
+        int n = at_query(h->fd, "AT+QCAINFO", L, 3);
+        h->nscc = 0;
+        for (int i = 0; i < n && h->nscc < 4; i++) {
+            unsigned e;
+            int rbs, st, pci;
+            double rp, rq, rs, sn;
+            char band[32];
+            if (strncmp(L[i], "+QCAINFO:", 9) ||
+                sscanf(L[i] + 9, " \"scc\",%u,%d,\"%31[^\"]\",%d,%d,%lf,%lf,%lf,%lf", &e, &rbs, band, &st, &pci, &rp, &rq, &rs, &sn) != 9)
+                continue;
+            h->scc[h->nscc].earfcn = e;
+            h->scc[h->nscc].pci = pci;
+            h->scc[h->nscc].rsrp = rp;
+            h->scc[h->nscc].rsrq = rq;
+            h->scc[h->nscc++].sinr = sn;
+        }
+    }
+}
+
+/* (earfcn, pci) is a secondary cell of carrier aggregation: its DIAG measurements are no handover neighbour */
+static int is_scc(const health_t *h, unsigned earfcn, int pci)
+{
+    for (int i = 0; i < h->nscc; i++)
+        if (h->scc[i].earfcn == earfcn && h->scc[i].pci == pci) return 1;
+    return 0;
+}
+
+/* strongest neighbour that is not a secondary cell, -1 if none; *n = how many such neighbours */
+static int best_nb(const stats_t *s, const health_t *h, int *n)
+{
+    int b = -1;
+    *n = 0;
+    for (int j = 0; j < s->nnb; j++) {
+        if (!s->nb[j].rsrp.n || is_scc(h, s->nb[j].earfcn, s->nb[j].pci) ||
+            (s->scc_rf_n && s->nb[j].earfcn == s->scc_earfcn && s->nb[j].pci == s->scc_pci)) continue;
+        (*n)++;
+        if (b < 0 || mean(&s->nb[j].rsrp) > mean(&s->nb[b].rsrp)) b = j;
+    }
+    return b;
 }
 
 static char *pct(char *o, double a, double b)
@@ -366,6 +425,7 @@ int main(int argc, char **argv)
     int have_toff = 0;
     double tot_t = 0, peak_dl = 0, peak_ul = 0;
     long long tot_dl_bytes = 0, tot_ul_bytes = 0;
+    int tot_dl_unknown = 0;  /* PDSCH only in a version not decoded: downlink totals NA */
     long tot_dltb = 0, tot_first = 0, tot_fail = 0, tot_retx = 0, tot_resid = 0, tot_ultx = 0, tot_ulretx = 0, tot_pwrlim = 0, tot_qwarn = 0;
     double tot_qmax = 0, tot_bufmax = 0, pl_min = 0, pl_max = 0;
     long long tot_grx = 0, tot_gused = 0;
@@ -435,7 +495,7 @@ int main(int argc, char **argv)
         snprintf(qs + n0, sizeof(qs) - n0, s.phr.n ? "%3.0f" : "  -", mean(&s.phr));
         if (hq) { if (qm > tot_qmax) tot_qmax = qm; tot_qwarn += stats_queue_warn(&s, el); }
         long nph = s.ul_ack + s.ul_nack;
-        int bn = stats_best_nb(&s);
+        int nnb, bn = best_nb(&s, &hl, &nnb);
         /* serving RSRP: 0xB179's filtered value, else the better antenna of 0xB193 */
         int hm = bn >= 0 && (s.nb_srv.n > 0 || s.rf_valid);
         double srv = s.nb_srv.n ? mean(&s.nb_srv) : s.rsrp0 > s.rsrp1 ? s.rsrp0 : s.rsrp1;
@@ -445,15 +505,17 @@ int main(int argc, char **argv)
             long ntb = s.ntb[1] + s.ntb[2], nri = s.ri[1] + s.ri[2];
             kv_start(hl.model);
             kv_s("time", tm);
-            kv_l("dl_tbs", s.dl_tb);
+            int dlok = !s.dl_unknown || s.dl_tb;  /* NA: the modem logs PDSCH in a version not decoded (EP06) */
+            kv_lna("dl_tbs", dlok, s.dl_tb);
             kv_f("dl_bler", s.dl_first > 0, 100.0 * s.dl_first_fail / (s.dl_first ? s.dl_first : 1), 1, "%");
-            kv_l("dl_harq_retx", s.dl_retx);
+            kv_lna("dl_harq_retx", dlok, s.dl_retx);
             kv_f("dl_harq_retx_pct", s.dl_tb > 0, 100.0 * s.dl_retx / (s.dl_tb ? s.dl_tb : 1), 1, "%");
-            kv_l("dl_resid", s.dl_resid);
+            kv_lna("dl_resid", dlok, s.dl_resid);
             kv_f("dl_mcs", s.mcs.n > 0, mean(&s.mcs), 1, "");
             kv_f("dl_rbs", s.rbs.n > 0, mean(&s.rbs), 1, "");
             kv_f("dl_mimo", ntb > 0, 100.0 * s.ntb[2] / (ntb ? ntb : 1), 0, "%");
-            kv_f("dl_rate", 1, dlm, 2, "Mbps");
+            kv_f("dl_rate", dlok, dlm, 2, "Mbps");
+            kv_f("dl_scc_rate", dlok && (hl.nscc > 0 || s.scc_rf_n > 0 || s.dl_scc_bytes > 0), s.dl_scc_bytes * 8 / el / 1e6, 2, "Mbps");
             kv_f("pdcch_agg", s.pdcch_agg.n > 0, mean(&s.pdcch_agg), 2, "");
             kv_l("ul_tx", (long)s.ul_n);
             kv_l("ul_harq_retx", ulr);
@@ -461,7 +523,7 @@ int main(int argc, char **argv)
             kv_l("ul_nack", s.ul_nack);
             kv_f("ul_nack_pct", nph > 0, 100.0 * s.ul_nack / (nph ? nph : 1), 1, "%");
             kv_f("ul_rate", 1, ulm, 2, "Mbps");
-            kv_f("ul_grant", 1, s.grant_rx * 8 / el / 1e6, 2, "Mbps");
+            kv_f("ul_grant", !s.grant_unknown || s.grant_rx, s.grant_rx * 8 / el / 1e6, 2, "Mbps");
             kv_f("ul_grant_used", s.grant_rx > 0, 100.0 * s.grant_used / (s.grant_rx ? s.grant_rx : 1), 0, "%");
             kv_f("ul_rbs", s.ul_rb.n > 0, mean(&s.ul_rb), 1, "");
             kv_s("ul_mod", s.ul_n && m ? MODS[m] : "NA");
@@ -482,7 +544,7 @@ int main(int argc, char **argv)
             kv_l("qwarn", stats_queue_warn(&s, el));
             kv_f("phr", s.phr.n > 0, mean(&s.phr), 0, "dB");
             for (int k = 0; k < L2_N; k++)
-                kv_f(L2_NAME[k], s.l2_valid, s.l2[k], 0, "");
+                kv_f(L2_NAME[k], s.l2_valid & L2_SRC[k], s.l2[k], 0, "");
             kv_f("cqi0", s.cqi.n > 0, mean(&s.cqi), 1, "");
             kv_f("cqi1", s.cqi1.n > 0, mean(&s.cqi1), 1, "");
             kv_f("ri", nri > 0, (s.ri[1] + 2.0 * s.ri[2]) / (nri ? nri : 1), 1, "");
@@ -497,12 +559,23 @@ int main(int argc, char **argv)
             kv_f("snr1", s.rf_valid, s.snr1, 1, "dB");
             kv_f("rsrq", s.rf_valid, s.rsrq, 1, "dB");
             kv_f("rssi", s.rf_valid, s.rssi, 1, "dBm");
-            kv_l("ncells", s.nnb);
+            kv_l("ncells", nnb);
             kv_f("nb_earfcn", bn >= 0, bn >= 0 ? s.nb[bn].earfcn : 0, 0, "");
             kv_f("nb_pci", bn >= 0, bn >= 0 ? s.nb[bn].pci : 0, 0, "");
             kv_f("nb_rsrp", bn >= 0, bn >= 0 ? mean(&s.nb[bn].rsrp) : 0, 1, "dBm");
             kv_f("nb_rsrq", bn >= 0 && s.nb[bn].rsrq.n > 0, bn >= 0 ? mean(&s.nb[bn].rsrq) : 0, 1, "dB");
             kv_f("ho_margin", hm, margin, 1, "dB");
+            /* secondary cell: its serving cell measurement, else the neighbour measurement of it, else AT */
+            int sm = s.scc_rf_n > 0, sj = -1, cc = sm || hl.nscc > 0;
+            unsigned sce = sm ? s.scc_earfcn : hl.scc[0].earfcn;
+            int scp = sm ? s.scc_pci : hl.scc[0].pci;
+            for (int j = 0; cc && !sm && j < s.nnb; j++)
+                if (s.nb[j].earfcn == sce && s.nb[j].pci == scp && s.nb[j].rsrp.n) sj = j;
+            kv_f("scc_earfcn", cc, sce, 0, "");
+            kv_f("scc_pci", cc, scp, 0, "");
+            kv_f("scc_rsrp", cc, sm ? s.scc_rsrp : sj >= 0 ? mean(&s.nb[sj].rsrp) : hl.scc[0].rsrp, 1, "dBm");
+            kv_f("scc_rsrq", cc, sm ? s.scc_rsrq : sj >= 0 && s.nb[sj].rsrq.n ? mean(&s.nb[sj].rsrq) : hl.scc[0].rsrq, 1, "dB");
+            kv_f("scc_sinr", hl.nscc > 0, hl.scc[0].sinr, 0, "dB");
             kv_s("trigger", trig.valid ? trig.name : "NA");
             kv_f("trigger_gap", trig.valid, trig.gap, 1, "dB");
             kv_f("trigger_nb", trig.valid && trig.have_nb, trig.nb_val, 1, trig.nb_q ? "dB" : "dBm");
@@ -536,6 +609,7 @@ int main(int argc, char **argv)
         tot_dl_bytes += s.dl_ok_bytes;
         tot_ul_bytes += s.ul_bytes;
         tot_dltb += s.dl_tb;
+        if (s.dl_unknown && !s.dl_tb) tot_dl_unknown = 1;
         tot_first += s.dl_first;
         tot_fail += s.dl_first_fail;
         tot_retx += s.dl_retx;
@@ -567,13 +641,13 @@ int main(int argc, char **argv)
         kv_start(hl.model);
         kv_s("event", "summary");
         kv_f("duration", 1, tot_t, 0, "s");
-        kv_f("dl_total", 1, tot_dl_bytes / 1e6, 1, "MB");
-        kv_f("dl_avg", 1, tot_dl_bytes * 8 / tot_t / 1e6, 2, "Mbps");
-        kv_f("dl_peak", 1, peak_dl, 2, "Mbps");
+        kv_f("dl_total", !tot_dl_unknown, tot_dl_bytes / 1e6, 1, "MB");
+        kv_f("dl_avg", !tot_dl_unknown, tot_dl_bytes * 8 / tot_t / 1e6, 2, "Mbps");
+        kv_f("dl_peak", !tot_dl_unknown, peak_dl, 2, "Mbps");
         kv_f("dl_bler", tot_first > 0, 100.0 * tot_fail / (tot_first ? tot_first : 1), 1, "%");
-        kv_l("dl_harq_retx", tot_retx);
+        kv_lna("dl_harq_retx", !tot_dl_unknown, tot_retx);
         kv_f("dl_harq_retx_pct", tot_dltb > 0, 100.0 * tot_retx / (tot_dltb ? tot_dltb : 1), 1, "%");
-        kv_l("dl_resid", tot_resid);
+        kv_lna("dl_resid", !tot_dl_unknown, tot_resid);
         kv_f("ul_total", 1, tot_ul_bytes / 1e6, 1, "MB");
         kv_f("ul_avg", 1, tot_ul_bytes * 8 / tot_t / 1e6, 2, "Mbps");
         kv_f("ul_peak", 1, peak_ul, 2, "Mbps");

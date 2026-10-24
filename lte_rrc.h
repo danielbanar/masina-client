@@ -476,6 +476,9 @@ static const char *rrc_ota_msg(const uint8_t *b, int len, int *pci, unsigned *ea
 {
     static const char *CH[10] = { NULL, "BCCH_BCH", "BCCH_DL_SCH", NULL, "MCCH", "PCCH", "DL_CCCH", "DL_DCCH", "UL_CCCH",
                                   "UL_DCCH" };
+    /* before v15 (EP06: v13) the channel numbers are one lower from PCCH on (SIM7600: v20) */
+    static const char *CH_OLD[9] = { NULL, "BCCH_BCH", "BCCH_DL_SCH", NULL, "PCCH", "DL_CCCH", "DL_DCCH", "UL_CCCH",
+                                     "UL_DCCH" };
     if (len < 19 || b[0] < 8 || b[0] >= 25) return NULL;
     *pci = b[4] | b[5] << 8;
     *earfcn = b[6] | b[7] << 8 | b[8] << 16 | (unsigned)b[9] << 24;
@@ -483,6 +486,7 @@ static const char *rrc_ota_msg(const uint8_t *b, int len, int *pci, unsigned *ea
     if (l > len - 19) l = len - 19;
     *msg = b + 19;
     *mlen = l;
+    if (b[0] < 15) return b[12] < 9 ? CH_OLD[b[12]] : NULL;
     return b[12] < 10 ? CH[b[12]] : NULL;
 }
 

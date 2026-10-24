@@ -25,8 +25,9 @@
  * The network's own rules (modem_link's trigger fields: the measurement rule closest to firing) say when the link is
  * about to change:
  *   edge      -> a rule within 2 dB of firing (A2 band search, A3/A5 handover, the last-resort A2 before a release;
- *                not A1, the signal getting better): no raising, the link it would probe is about to go. Cuts still
- *                happen, at the cell edge the uplink is short of transmit power.
+ *                not A1, the signal getting better, nor an A1 / A2 about a secondary cell of carrier aggregation,
+ *                A2@<other EARFCN>, which only carries downlink): no raising, the link it would probe is about to go.
+ *                Cuts still happen, at the cell edge the uplink is short of transmit power.
  *   handover  -> for 1 s after the serving cell changes (a handover, or service back after a release) no cut: the
  *                queue the switch built drains on the new cell, which is usually the better one.
  *   no service-> no serving cell (radio link lost, released): no raising. The queue fields are NA then, which the
@@ -494,8 +495,11 @@ static void release(alink_t *a, const conf_t *c, const char *reason)
 /* the network's view of the link from modem_link's trigger and serving cell: sets a->edge, a->cell, a->grace_until */
 static void link_state(alink_t *a, const link_t *l, double t)
 {
-    /* entered at EDGE_GAP, left 1 dB above it so a gap hovering at the threshold does not report on every line */
-    int edge = l->has_trigger && strncmp(l->trigger, "A1", 2) && l->trigger_gap <= EDGE_GAP + (a->edge ? 1 : 0);
+    /* entered at EDGE_GAP, left 1 dB above it so a gap hovering at the threshold does not report on every line;
+     * an A2 on another frequency than the serving cell's is about a secondary cell (downlink only) */
+    const char *f = strchr(l->trigger, '@');
+    int scc = l->has_trigger && !strncmp(l->trigger, "A2", 2) && f && l->has_cell && strtod(f + 1, NULL) != l->earfcn;
+    int edge = l->has_trigger && strncmp(l->trigger, "A1", 2) && !scc && l->trigger_gap <= EDGE_GAP + (a->edge ? 1 : 0);
     if (edge && !a->edge)
         report(a, "edge", a->current, l);
     a->edge = edge;

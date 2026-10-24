@@ -323,7 +323,7 @@ __attribute__((unused)) static int diag_model(diag_t *d, char *dst, size_t dsz)
 /* Quectel (EC2x/EG/EM/BG/RM) vs SIMCom by model name */
 __attribute__((unused)) static int is_quectel(const char *model)
 {
-    return (model[0] == 'E' && strchr("CGM", model[1]) && isdigit((unsigned char)model[2])) ||
+    return (model[0] == 'E' && strchr("CGMP", model[1]) && isdigit((unsigned char)model[2])) ||
            !strncmp(model, "BG", 2) || !strncmp(model, "RM", 2);
 }
 
@@ -375,11 +375,14 @@ __attribute__((unused)) static double parse_volt(const char *v)
 enum { RLC_UL_RETX, RLC_UL_NACK, RLC_UL_TPOLL, RLC_DL_RETX, RLC_DL_NACK, RLC_DL_DROP, RLC_DL_TREORD, PDCP_UL_DISCARD, L2_N };
 __attribute__((unused)) static const char *L2_NAME[L2_N] = { "rlc_ul_retx", "rlc_ul_nack", "rlc_ul_tpoll", "rlc_dl_retx",
     "rlc_dl_nack", "rlc_dl_drop", "rlc_dl_treord", "pdcp_ul_discard" };
+/* which statistics packet (l2_valid bit) each counter comes from: the EP06 has no RLC UL statistics */
+__attribute__((unused)) static const int L2_SRC[L2_N] = { 1, 1, 1, 2, 2, 2, 2, 4 };
 
 typedef struct {
-    struct { uint8_t valid, ndi, ok; } harq[16][2];  /* persists across resets */
+    struct { uint8_t valid, ndi, ok; } harq[2][16][2];  /* per carrier, HARQ process, TB; persists across resets */
     long dl_tb, dl_first, dl_first_fail, dl_retx, dl_resid;
-    long long dl_ok_bytes;
+    int dl_unknown, grant_unknown;  /* PDSCH / UL grant packets came in a version not decoded here: their fields are NA */
+    long long dl_ok_bytes, dl_scc_bytes;  /* decoded DL bytes, all carriers / secondary carrier (carrier aggregation) */
     acc_t mcs, rbs, tbs;
     long ntb[3];         /* codewords per new-data subframe (2 = 2x2 spatial multiplexing) */
     long dl_mod[3];      /* QPSK/16QAM/64QAM from MCS, all C-RNTI TBs */
@@ -396,11 +399,14 @@ typedef struct {
     uint32_t earfcn;
     int pci;
     double rsrp0, rsrp1, snr0, snr1, rsrq, rssi;
+    int scc_rf_n, scc_pci;           /* secondary cell of carrier aggregation (0xB193 v22 serving cell index 1) */
+    uint32_t scc_earfcn;
+    double scc_rsrp, scc_rsrq;       /* mean over the interval; RSRP of the better antenna */
     acc_t ul_buf;                    /* exact UL buffer bytes, one sample per subframe */
     long long grant_rx, grant_used;  /* UL grant bytes from the eNB / used */
     long ul_ack, ul_nack;            /* PHICH */
     acc_t pdcch_agg, ul_txpwr, pathloss, pc_corr;
-    int l2_valid;                    /* an RLC/PDCP statistics packet arrived in this interval */
+    int l2_valid;                    /* statistics packets in this interval: 1 RLC UL, 2 RLC DL, 4 PDCP UL (L2_SRC) */
     long l2[L2_N];
     acc_t nb_srv;                    /* serving RSRP as seen by the neighbour measurement */
     struct { unsigned earfcn; int pci; acc_t rsrp, rsrq; } nb[16];  /* neighbours, all measured frequencies */
@@ -431,40 +437,53 @@ __attribute__((unused)) static void stats_reset(stats_t *s)
     s->ul_cap = cap;
 }
 
+/* one PDSCH transport block (h: HARQ id, NDI, CRC ok; f2: RNTI type, TB index; TB size; MCS) on carrier cc;
+ * 0 if it is not C-RNTI data (SI / paging / RA) */
+static int pdsch_tb(stats_t *s, int cc, const uint8_t *t, int *fresh)
+{
+    int h = t[0], f2 = t[1], tbs = rd16(t + 2), mcs = t[4];
+    if (f2 & 0xf) return 0;
+    int hid = h & 0xf, tbi = (f2 >> 4) & 1, ndi = (h >> 6) & 1, ok = h >> 7;
+    __typeof__(s->harq[0][0][0]) *p = &s->harq[cc][hid][tbi];
+    int isnew = !p->valid || p->ndi != ndi;
+    if (isnew && p->valid && !p->ok)
+        s->dl_resid++;  /* previous TB on this process never decoded */
+    p->valid = 1; p->ndi = ndi; p->ok = ok;
+    s->dl_tb++;
+    if (mcs < 29) {
+        s->dl_mod[mcs < 10 ? 0 : mcs < 17 ? 1 : 2]++;
+        acc(&s->tbs, tbs);
+    }
+    if (isnew) {
+        (*fresh)++;
+        s->dl_first++;
+        s->dl_first_fail += !ok;
+        if (mcs < 29) acc(&s->mcs, mcs);
+    } else
+        s->dl_retx++;
+    if (ok) {
+        s->dl_ok_bytes += tbs;
+        if (cc) s->dl_scc_bytes += tbs;
+    }
+    return 1;
+}
+
+/* v5: 20-byte records, TBs of 6 bytes from byte 6, RBs at 11. v24 (EP06, checked against bytes received by the host):
+ * a 24-byte record per carrier and subframe, RBs at 2, TB count at 4, carrier index at 5 (0 = primary), TBs of 8
+ * bytes from byte 6 */
 static void stats_pdsch(stats_t *s, const uint8_t *b, int len)
 {
-    if (len < 4 || b[0] != 5)
+    int v24 = len >= 4 && b[0] == 24, rs = v24 ? 24 : 20, ts = v24 ? 8 : 6;
+    if (len >= 1 && b[0] != 5 && !v24) s->dl_unknown = 1;
+    if (len < 4 || (b[0] != 5 && !v24))
         return;
-    for (int i = 0; i < b[1] && 24 + 20 * i <= len; i++) {
-        const uint8_t *r = b + 4 + 20 * i;
-        int nt = r[4] > 2 ? 2 : r[4], fresh = 0, brk = 0;
-        for (int k = 0; k < nt; k++) {
-            const uint8_t *t = r + 6 + 6 * k;
-            int h = t[0], f2 = t[1], tbs = rd16(t + 2), mcs = t[4];
-            if (f2 & 0xf) { brk = 1; break; }  /* not C-RNTI (SI/P/RA-RNTI) */
-            int hid = h & 0xf, tbi = (f2 >> 4) & 1, ndi = (h >> 6) & 1, ok = h >> 7;
-            __typeof__(s->harq[0][0]) *p = &s->harq[hid][tbi];
-            int isnew = !p->valid || p->ndi != ndi;
-            if (isnew && p->valid && !p->ok)
-                s->dl_resid++;  /* previous TB on this process never decoded */
-            p->valid = 1; p->ndi = ndi; p->ok = ok;
-            s->dl_tb++;
-            if (mcs < 29) {
-                s->dl_mod[mcs < 10 ? 0 : mcs < 17 ? 1 : 2]++;
-                acc(&s->tbs, tbs);
-            }
-            if (isnew) {
-                fresh++;
-                s->dl_first++;
-                s->dl_first_fail += !ok;
-                if (mcs < 29) acc(&s->mcs, mcs);
-            } else
-                s->dl_retx++;
-            if (ok)
-                s->dl_ok_bytes += tbs;
-        }
+    for (int i = 0; i < b[1] && 4 + rs * (i + 1) <= len; i++) {
+        const uint8_t *r = b + 4 + rs * i;
+        int nt = r[4] > 2 ? 2 : r[4], cc = v24 ? r[5] & 1 : 0, fresh = 0, brk = 0;
+        for (int k = 0; k < nt && !brk; k++)
+            brk = !pdsch_tb(s, cc, r + 6 + ts * k, &fresh);
         if (!brk && fresh) {
-            acc(&s->rbs, r[11]);
+            acc(&s->rbs, v24 ? r[2] : r[11]);
             s->ntb[nt]++;
         }
     }
@@ -472,10 +491,13 @@ static void stats_pdsch(stats_t *s, const uint8_t *b, int len)
 
 static void stats_pusch(stats_t *s, const uint8_t *b, int len)
 {
-    if (len < 8 || b[0] != 25)
+    /* v25: 48-byte records; v102 (EP06): 68-byte records, TB size in bytes, no code rate field (worked out from TB
+     * size, RBs and modulation over 12 data symbols x 12 subcarriers per RB) */
+    int v102 = len >= 8 && b[0] == 102, rs = v102 ? 68 : 48;
+    if (len < 8 || (b[0] != 25 && !v102))
         return;
-    for (int i = 0; i < (len - 8) / 48; i++) {
-        const uint8_t *r = b + 8 + 48 * i;
+    for (int i = 0; i < (len - 8) / rs; i++) {
+        const uint8_t *r = b + 8 + rs * i;
         uint16_t t = rd16(r);  /* SFN*10 + subframe */
         if (s->ul_n == s->ul_cap) {
             s->ul_cap = s->ul_cap ? s->ul_cap * 2 : 4096;
@@ -483,9 +505,13 @@ static void stats_pusch(stats_t *s, const uint8_t *b, int len)
         }
         s->ul_tx[s->ul_n++] = t;
         if (t < 10240) s->ul_txmap[t >> 3] |= 1 << (t & 7);
-        acc(&s->ul_rate, rd16(r + 2) / 1024.0);  /* code rate */
-        acc(&s->ul_rb, bits(r, 89, 7));
-        s->ul_mod[bits(r, 154, 2)]++;            /* 1 QPSK, 2 16QAM, 3 64QAM */
+        int rb = bits(r, v102 ? 47 : 89, 7), mod = bits(r, v102 ? 87 : 154, 2);  /* mod: 1 QPSK, 2 16QAM, 3 64QAM */
+        if (!v102)
+            acc(&s->ul_rate, rd16(r + 2) / 1024.0);  /* code rate */
+        else if (rb && mod)
+            acc(&s->ul_rate, rd16(r + 8) * 8.0 / (rb * 144.0 * 2 * mod));
+        acc(&s->ul_rb, rb);
+        s->ul_mod[mod]++;
         int p = (int8_t)r[24];                   /* requested PUSCH power, dBm */
         acc(&s->ul_pwr, p);
         s->ul_pwrlim += p > 23;
@@ -535,19 +561,20 @@ static void stats_mac_ul(stats_t *s, const uint8_t *b, int len)
         const uint8_t *body = b + pos + 4;
         if (sz > len - pos - 4) sz = len - pos - 4;  /* size field counts its own header on this firmware */
         pos += 4 + sz;
-        if (sid != 8 || ver != 1 || sz < 1) continue;
-        int p = 1;
-        for (int j = 0; j < body[0] && p + 12 <= sz; j++) {
-            int sfsf = rd16(body + p + 2), grant = rd16(body + p + 4), pad = rd16(body + p + 7);
+        if (sid != 8 || (ver != 1 && ver != 2) || sz < 1) continue;
+        int p = 1, o = ver == 2 ? 2 : 0;  /* v2 (EP06): two more bytes before the same fields */
+        for (int j = 0; j < body[0] && p + 12 + o <= sz; j++) {
+            const uint8_t *e = body + p + o;
+            int sfsf = rd16(e + 2), grant = rd16(e + 4), pad = rd16(e + 7);
             int t = ((sfsf >> 4) % 1024) * 10 + (sfsf & 15);
             if (t < 10240) s->ul_new[t >> 3] |= 1 << (t & 7);
             s->ul_bytes += grant - pad;
-            int hl = body[p + 11], bsr, phr;
-            if (hl > sz - p - 12) hl = sz - p - 12;
-            mac_ce(body + p + 12, hl, &bsr, &phr);
+            int hl = e[11], bsr, phr;
+            if (hl > sz - p - o - 12) hl = sz - p - o - 12;
+            mac_ce(e + 12, hl, &bsr, &phr);
             if (bsr >= 0) acc(&s->bsr, bsr);
             if (phr > -100) acc(&s->phr, phr);
-            p += 12 + body[p + 11];
+            p += 12 + o + e[11];
         }
     }
 }
@@ -556,6 +583,14 @@ static void stats_csi(stats_t *s, const uint8_t *b, int len)
 {
     if (len < 7)
         return;
+    if (b[0] == 101) {  /* v101 (EP06): reports for two carriers (byte 1 bit 7), the main one has bit 7 clear;
+                         * rank in byte 9 bit 2 (rank 1 reports come with CQI codeword 1 = 0) */
+        if (b[1] >> 7) return;
+        if ((b[3] & 0xf) == 6) {
+            if (len >= 10) s->ri[(b[9] >> 2 & 1) + 1]++;
+            return;
+        }
+    }
     if ((b[3] & 0xf) == 4) {  /* wideband CQI/PMI report: CQI codeword 0, codeword 1 (0 when rank 1) */
         int v = b[5] | b[6] << 8;
         acc(&s->cqi, v >> 2 & 0xf);
@@ -564,30 +599,70 @@ static void stats_csi(stats_t *s, const uint8_t *b, int len)
         s->ri[(b[4] >> 7) + 1]++;
 }
 
+/* 0xB193 serving cell measurement subpacket 25 -> EARFCN, PCI, serving cell index (0 = primary, 1.. = secondary
+ * cells of carrier aggregation), v[] = RSRP RX0/RX1, SNR RX0/RX1 (approximate), RSRQ, RSSI; 0 if not one.
+ * v22 (EP06): a cell-count word before the cell, so the fields sit further on (checked against AT+QRSRP /
+ * AT+QENG="servingcell", AT+QCAINFO); other versions (v18 SIM7600 / EC25): the old layout. */
+static int meas_parse(const uint8_t *b, int len, uint32_t *earfcn, int *pci, int *cell, double v[6])
+{
+    uint32_t w[22];
+    if (len < 8 + 84 || b[4] != 0x19)
+        return 0;
+    int v22 = b[5] == 22, n = v22 ? 22 : 21;
+    if (len < 8 + 4 * n)
+        return 0;
+    for (int i = 0; i < n; i++) w[i] = rd32(b + 8 + 4 * i);
+    *earfcn = w[0];
+    *cell = 0;
+    if (v22) {
+        *pci = w[2] & 0x1ff;
+        *cell = w[2] >> 9 & 7;
+        v[0] = (w[7] & 0xfff) / 16.0 - 180;          /* RSRP RX0 (matches AT+QRSRP) */
+        v[1] = (w[8] & 0xfff) / 16.0 - 180;          /* RSRP RX1 */
+        v[2] = (w[21] & 0x1ff) / 10.0 - 20;          /* SNR RX0, approximate */
+        v[3] = ((w[21] >> 9) & 0x1ff) / 10.0 - 20;   /* SNR RX1, approximate */
+        v[4] = (w[12] >> 10 & 0x3ff) / 16.0 - 30;    /* combined RSRQ (matches AT+QENG) */
+        v[5] = (w[15] & 0x7ff) / 16.0 - 110;         /* combined RSSI (matches AT+QENG) */
+    } else {
+        *pci = w[1] & 0x1ff;
+        v[0] = (w[6] & 0xfff) / 16.0 - 180;          /* RSRP RX0 */
+        v[1] = (w[7] & 0xfff) / 16.0 - 180;          /* RSRP RX1 */
+        v[2] = (w[17] & 0x1ff) / 10.0 - 20;          /* SNR RX0, approximate */
+        v[3] = ((w[17] >> 9) & 0x1ff) / 10.0 - 20;   /* SNR RX1, approximate */
+        v[4] = (w[9] >> 20 & 0x3ff) / 16.0 - 30;     /* combined RSRQ (matches AT+CPSI) */
+        v[5] = (w[11] & 0x7ff) / 16.0 - 110;         /* combined RSSI, both antennas (matches AT+CPSI) */
+    }
+    return 1;
+}
+
 static void stats_meas(stats_t *s, const uint8_t *b, int len)
 {
-    if (len < 8 + 84 || b[4] != 0x19)
+    uint32_t earfcn;
+    int pci, cell;
+    double v[6];
+    if (!meas_parse(b, len, &earfcn, &pci, &cell, v))
         return;
-    uint32_t w[21];
-    for (int i = 0; i < 21; i++) w[i] = rd32(b + 8 + 4 * i);
-    if (s->rf_valid && (s->earfcn != w[0] || s->pci != (int)(w[1] & 0x1ff)))
+    if (cell) {  /* secondary cell: its own fields, the serving ones stay the primary cell's */
+        if (s->scc_rf_n && (s->scc_earfcn != earfcn || s->scc_pci != pci))
+            s->scc_rf_n = 0;
+        double rp = v[0] > v[1] ? v[0] : v[1];
+        s->scc_rf_n++;
+        s->scc_rsrp = s->scc_rf_n == 1 ? rp : s->scc_rsrp + (rp - s->scc_rsrp) / s->scc_rf_n;
+        s->scc_rsrq = s->scc_rf_n == 1 ? v[4] : s->scc_rsrq + (v[4] - s->scc_rsrq) / s->scc_rf_n;
+        s->scc_earfcn = earfcn;
+        s->scc_pci = pci;
+        return;
+    }
+    if (s->rf_valid && (s->earfcn != earfcn || s->pci != pci))
         s->rf_n = 0;  /* new cell: don't mix measurements */
-    double v[6] = {
-        (w[6] & 0xfff) / 16.0 - 180,          /* RSRP RX0 */
-        (w[7] & 0xfff) / 16.0 - 180,          /* RSRP RX1 */
-        (w[17] & 0x1ff) / 10.0 - 20,          /* SNR RX0, approximate */
-        ((w[17] >> 9) & 0x1ff) / 10.0 - 20,   /* SNR RX1, approximate */
-        (w[9] >> 20 & 0x3ff) / 16.0 - 30,     /* combined RSRQ (matches AT+CPSI) */
-        (w[11] & 0x7ff) / 16.0 - 110,         /* combined RSSI, both antennas (matches AT+CPSI) */
-    };
     double *dst[6] = { &s->rsrp0, &s->rsrp1, &s->snr0, &s->snr1, &s->rsrq, &s->rssi };
     /* single samples (~50/s) are noisy (RSRQ +-3 dB): keep the running mean over the interval */
     s->rf_n++;
     for (int i = 0; i < 6; i++)
         *dst[i] = s->rf_n == 1 ? v[i] : *dst[i] + (v[i] - *dst[i]) / s->rf_n;
     s->rf_valid = 1;
-    s->earfcn = w[0];
-    s->pci = w[1] & 0x1ff;
+    s->earfcn = earfcn;
+    s->pci = pci;
 }
 
 /* ---- extra MAC/RLC/PDCP/PHY items (Qualcomm MDM9x07, verified on Quectel EC25) */
@@ -614,27 +689,44 @@ static void stats_ul_buf(stats_t *s, const uint8_t *b, int len)
     const uint8_t *p;
     subpkt_it it = { b, len, 0, 4 };
     while (subpkt_next(&it, &ver, &p, &pl)) {
-        if (ver != 5 || pl < 1) continue;
-        for (int k = 0, q = 1; k < p[0] && q + 3 <= pl; k++) {
+        if ((ver != 5 && ver != 24) || pl < 1) continue;
+        int pad = ver == 24;  /* v24 (EP06): a pad byte after the sample count and after each sample */
+        for (int k = 0, q = 1 + pad; k < p[0] && q + 3 <= pl; k++) {
             int nl = p[q + 2];
             double tot = 0;
             q += 3;
             for (int j = 0; j < nl && q + 16 <= pl; j++, q += 16)  /* lcid, prio, new (2 fields), retx, ctrl bytes */
                 tot += (double)rd32(p + q + 2) + rd32(p + q + 6) + rd32(p + q + 10) + rd16(p + q + 14);
             acc(&s->ul_buf, tot);
+            q += pad;
         }
     }
 }
 
 static void stats_ul_txst(stats_t *s, const uint8_t *b, int len)
 {
-    if (len < 21 || b[5] != 1) return;
-    uint32_t rx = rd32(b + 13), used = rd32(b + 17);
+    int v2 = len >= 22 && b[5] == 2;  /* v2 (EP06): the counters one byte further on (checked against MAC UL grants) */
+    if (len >= 6 && b[5] != 1 && !v2) s->grant_unknown = 1;
+    if ((len < 21 || b[5] != 1) && !v2) return;
+    uint32_t rx = rd32(b + 13 + v2), used = rd32(b + 17 + v2);
     if (used <= rx) { s->grant_rx += rx; s->grant_used += used; }
 }
 
 static void stats_phich(stats_t *s, const uint8_t *b, int len)
 {
+    if (len >= 4 && b[0] == 25) {  /* v25 (EP06): PHICH flag byte 0 bit 3, ACK byte 4 bit 5 (checked against
+                                    * retransmissions), PDCCH entry count byte 0 bits 0-2, entries of 8 bytes */
+        for (int i = 0; i < b[3] && 4 + 80 * (i + 1) <= len; i++) {
+            const uint8_t *r = b + 4 + 80 * i;
+            if (r[0] >> 3 & 1) {
+                if (r[4] >> 5 & 1) s->ul_ack++;
+                else s->ul_nack++;
+            }
+            for (int k = 0; k < (r[0] & 7) && 16 + 8 * (k + 1) <= 80; k++)
+                acc(&s->pdcch_agg, 1 << (r[17 + 8 * k] >> 6 & 3));
+        }
+        return;
+    }
     if (len < 4 || b[0] != 5) return;
     for (int i = 0; i < b[3] && 4 + 40 * (i + 1) <= len; i++) {
         const uint8_t *r = b + 4 + 40 * i;
@@ -650,7 +742,7 @@ static void stats_phich(stats_t *s, const uint8_t *b, int len)
 
 static void stats_pusch_pc(stats_t *s, const uint8_t *b, int len)
 {
-    if (len < 4 || b[0] != 5) return;
+    if (len < 4 || (b[0] != 5 && b[0] != 25)) return;  /* v25 (EP06): same records as v5 */
     for (int i = 0; i < b[3] && 4 + 12 * (i + 1) <= len; i++) {
         const uint8_t *r = b + 4 + 12 * i;
         uint32_t w1 = rd32(r + 4), w2 = rd32(r + 8);
@@ -672,12 +764,13 @@ static void stats_l2(stats_t *s, int code, const uint8_t *b, int len)
     int want, hdr, size, nc, ver, pl;
     const l2cnt_t *c;
     const uint8_t *p;
-    if (code == LOG_RLC_DL) { want = 3; hdr = 9; size = 262; c = RLC_DL_C; nc = 4; }
-    else if (code == LOG_RLC_UL) { want = 1; hdr = 5; size = 126; c = RLC_UL_C; nc = 3; }
-    else { want = 3; hdr = 5; size = 253; c = PDCP_UL_C; nc = 1; }
+    int src, want2 = -1;  /* want2: another version with the same records (EP06 PDCP UL: v24) */
+    if (code == LOG_RLC_DL) { want = 3; hdr = 9; size = 262; c = RLC_DL_C; nc = 4; src = 2; }
+    else if (code == LOG_RLC_UL) { want = 1; hdr = 5; size = 126; c = RLC_UL_C; nc = 3; src = 1; }
+    else { want = 3; want2 = 24; hdr = 5; size = 253; c = PDCP_UL_C; nc = 1; src = 4; }
     subpkt_it it = { b, len, 0, 4 };
     while (subpkt_next(&it, &ver, &p, &pl)) {
-        if (ver != want || pl < 1) continue;
+        if ((ver != want && ver != want2) || pl < 1) continue;
         for (int r = 0; r < p[0] && hdr + size * (r + 1) <= pl; r++) {
             const uint8_t *q = p + hdr + size * r;
             uint32_t v[4] = { 0 };
@@ -698,7 +791,7 @@ static void stats_l2(stats_t *s, int code, const uint8_t *b, int len)
             s->l2_last[j].rb = q[0];
             memcpy(s->l2_last[j].v, v, sizeof(v));
         }
-        s->l2_valid = 1;
+        s->l2_valid |= src;
     }
 }
 
@@ -827,7 +920,9 @@ static long stats_ul_retx(const stats_t *s)
  * does: on the L3-filtered serving RSRP of 0xB179 (else the better antenna of 0xB193, smoothed) and the latest
  * neighbour measurements (0xB179 intra-frequency, 0xB195 incl. inter-frequency; a cell on another band is only
  * measured while the network has gaps on, so it is usually unknown until the search runs). Rules with the same
- * condition on several frequencies count as one (A5@1875/3500/6400). offsetFreq / cell offsets are not decoded (0).
+ * condition on several frequencies count as one (A5@1875/3500/6400); an A1 / A2 on another frequency than the main
+ * cell's is about a secondary cell of carrier aggregation (A2@1850) and uses the cell measured there.
+ * offsetFreq / cell offsets are not decoded (0).
  * gap: dB the signal can still move before the entering condition holds (<= 0: holds; A5 without a measured
  * neighbour: the serving part only, 0 once it holds). held: ms the whole condition has held, against the rule's time
  * to trigger. */
@@ -837,7 +932,7 @@ typedef struct {
     char rep[112], name[48];   /* "A5[serving<rsrp-115dBm&nb>rsrp-113dBm,hys1dB,ttt480ms]", "A5@1875/3500/6400" */
     int ev, q1, q2, ttt;       /* 1..5 = A1..A5; threshold quantity 0 RSRP / 1 RSRQ; time to trigger, ms */
     double t1, t2, off, hys;   /* thresholds, A3 offset, hysteresis */
-    unsigned earfcn[8];        /* A3-A5 frequencies, 0 = the serving one ("@?") */
+    unsigned earfcn[8];        /* frequencies, 0 = the serving one ("@?"); A1 / A2: one, kept apart per frequency */
     int nf;
     double since;              /* modem time the whole condition started to hold, < 0 = not holding */
 } trig_rule_t;
@@ -876,8 +971,9 @@ static void trig_add(trig_t *t, const char *rep, int rl, const char *obj, int ol
     if (rl < 4 || rep[0] != 'A' || rep[1] < '1' || rep[1] > '5' || rep[2] != '[') return;
     snprintf(rs, sizeof(rs), "%.*s", rl, rep);
     snprintf(os, sizeof(os), "%.*s", ol, obj);
+    unsigned e = os[0] >= '0' && os[0] <= '9' ? (unsigned)strtoul(os, NULL, 10) : 0;  /* 0: "?" (or utra / geran) */
     for (int i = 0; i < t->nr; i++)
-        if (!strcmp(t->r[i].rep, rs)) r = &t->r[i];
+        if (!strcmp(t->r[i].rep, rs) && (t->r[i].ev >= 3 || t->r[i].earfcn[0] == e)) r = &t->r[i];
     if (!r) {
         if (t->nr == TRIG_MAX) return;
         r = &t->r[t->nr];
@@ -897,10 +993,14 @@ static void trig_add(trig_t *t, const char *rep, int rl, const char *obj, int ol
         r->ttt = atoi(tt + 4);
         snprintf(r->name, sizeof(r->name), "A%d", r->ev);
         t->nr++;
+        if (r->ev <= 2) {  /* the frequency decides which cell it is about: name it when it is a number */
+            r->earfcn[r->nf++] = e;
+            if (e) snprintf(r->name + 2, sizeof(r->name) - 2, "@%u", e);
+        }
     }
     if (r->ev >= 3 && r->nf < 8 && (os[0] == '?' || (os[0] >= '0' && os[0] <= '9'))) {
         size_t l = strlen(r->name);
-        r->earfcn[r->nf++] = os[0] == '?' ? 0 : (unsigned)strtoul(os, NULL, 10);
+        r->earfcn[r->nf++] = e;
         snprintf(r->name + l, sizeof(r->name) - l, "%s%s", r->nf == 1 ? "@" : "/", os);
     }
 }
@@ -943,7 +1043,7 @@ static void trig_nb_set(trig_t *t, double mts, unsigned earfcn, int pci, double 
     t->nb[j].rsrq = rsrq;
 }
 
-/* latest measurements (offsets as in stats_ncell / stats_conn_nb / stats_meas); 1 if the packet was one of them */
+/* latest measurements (offsets as in stats_ncell / stats_conn_nb, meas_parse); 1 if the packet was one of them */
 __attribute__((unused)) static int trig_feed(trig_t *t, int code, double mts, const uint8_t *b, int len)
 {
     if (code == LOG_NCELL) {
@@ -976,11 +1076,18 @@ __attribute__((unused)) static int trig_feed(trig_t *t, int code, double mts, co
             }
         }
     } else if (code == LOG_MEAS) {
-        if (len < 8 + 84 || b[4] != 0x19) return 0;
-        double r0 = (rd32(b + 32) & 0xfff) / 16.0 - 180, r1 = (rd32(b + 36) & 0xfff) / 16.0 - 180;
-        double rp = r0 > r1 ? r0 : r1, rq = (rd32(b + 44) >> 20 & 0x3ff) / 16.0 - 30;
-        unsigned e = rd32(b + 8);
-        int pci = rd32(b + 12) & 0x1ff, fresh = t->have_raw && mts - t->raw_t < 1 && e == t->raw_earfcn && pci == t->raw_pci;
+        uint32_t e;
+        int pci, cell;
+        double v[6];
+        if (!meas_parse(b, len, &e, &pci, &cell, v)) return 0;
+        double rp = v[0] > v[1] ? v[0] : v[1], rq = v[4];
+        if (cell) {  /* secondary cell: for A1 / A2 rules on its frequency */
+            trig_nb_set(t, mts, e, pci, rp, rq);
+            t->last_t = mts;
+            t->fed = 1;
+            return 1;
+        }
+        int fresh = t->have_raw && mts - t->raw_t < 1 && e == t->raw_earfcn && pci == t->raw_pci;
         /* single samples are noisy: smooth over ~20 (about the modem's L3 filter at 50 samples/s) */
         t->raw_rsrp = fresh ? t->raw_rsrp + (rp - t->raw_rsrp) / 20 : rp;
         t->raw_rsrq = fresh ? t->raw_rsrq + (rq - t->raw_rsrq) / 20 : rq;
@@ -1019,8 +1126,18 @@ __attribute__((unused)) static void trig_eval(trig_t *t, const char *rules, doub
                     on |= (r->earfcn[k] ? r->earfcn[k] : se) == t->nb[j].earfcn;
                 if (on && (!hn || v > mn)) { mn = v; hn = 1; }
             }
-        if (r->ev == 1) g = r->t1 + r->hys - ms[r->q1];
-        else if (r->ev == 2) g = ms[r->q1] - (r->t1 - r->hys);
+        double sv = ms[r->q1];  /* the cell an A1 / A2 is about: the main one, or the secondary cell on its frequency */
+        if (r->ev <= 2 && r->earfcn[0] && r->earfcn[0] != se) {
+            int have = 0;
+            for (int j = 0; j < t->nnb; j++) {
+                double v = r->q1 ? t->nb[j].rsrq : t->nb[j].rsrp;
+                if (mts - t->nb[j].t > 2 || t->nb[j].earfcn != r->earfcn[0] || (r->q1 && v < -29.99)) continue;
+                if (!have || v > sv) { sv = v; have = 1; }
+            }
+            if (!have) { r->since = -1; continue; }
+        }
+        if (r->ev == 1) g = r->t1 + r->hys - sv;
+        else if (r->ev == 2) g = sv - (r->t1 - r->hys);
         else if (r->ev == 3 && hn) g = ms[0] + r->off + r->hys - mn;
         else if (r->ev == 4 && hn) g = r->t1 + r->hys - mn;
         else if (r->ev == 5) {
