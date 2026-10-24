@@ -16,7 +16,7 @@ masinaclient: client.cpp utils.cpp
 masinatelemetry: telemetry.cpp utils.cpp
 	$(CXX) $(CXXFLAGS) telemetry.cpp utils.cpp -o $@ -Wl,--gc-sections
 
-modem_link: $(MODEM_SRCS) lte_common.h
+modem_link: $(MODEM_SRCS) lte_common.h lte_rrc.h
 	$(CC) $(CFLAGS) $(MODEM_SRCS) -o $@ -lm -Wl,--gc-sections
 
 modem_alink: modem_alink.c

@@ -1,4 +1,4 @@
-/* Live LTE link-quality monitor for SIM7600 (Qualcomm MDM9x07) over DIAG (/dev/ttyUSB0).
+/* Live LTE link-quality monitor for SIM7600 / Quectel EC25 (Qualcomm MDM9x07) over DIAG (/dev/ttyUSB0).
  *
  * Per interval prints:
  *   DL  (0xB173 PDSCH stat v5): scheduled TBs, first-tx BLER, HARQ retx, residual HARQ failures
@@ -12,10 +12,27 @@
  *   CSI (0xB14D PUCCH CSI v24): wideband CQI per codeword and rank indicator (RI)
  *   RF  (0xB193 serving cell meas v18): EARFCN, PCI, RSRP per RX antenna and their difference, SNR per RX
  *       (approximate), combined RSRQ and RSSI; all averaged over the interval
- *   Modem temperature / supply voltage via AT (AT+CPMUTEMP, AT+CBC) every 5 s; '-' if the AT port is busy.
+ *   UL grant / power / HARQ (0xB067 MAC UL Tx stats, 0xB16E PUSCH power control v5, 0xB16B PHICH v5): Mbit/s granted
+ *       by the eNB and share used, PHICH NACKs (direct UL HARQ failures), actual tx power, DL path loss, closed-loop
+ *       power correction f(i), mean PDCCH aggregation level (1 good .. 8 = eNB protecting control in poor radio)
+ *   UL buffer (0xB066 MAC UL buffer status v5): exact bytes queued in the modem every subframe (BSR tops out at
+ *       150 KB); queue delay uses it when logged
+ *   RLC / PDCP (0xB087, 0xB097, 0xB0B4 statistics): retransmissions, NACKs, dropped PDUs, t-Reordering expiries,
+ *       PDCP discards, increase over the interval (NA = no statistics packet in the interval, they come every ~1.3 s)
+ *   Neighbours (0xB179 v4 intra-frequency, 0xB195 every measured frequency): count, strongest EARFCN/PCI/RSRP/RSRQ,
+ *       handover margin = serving - best neighbour RSRP
+ *   Mobility events, printed when they happen (RRC 0xB0C0 via lte_rrc.h, RACH 0xB061/0xB062): rrc_setup / rrc_release,
+ *       meas_config (the network's handover rules: measured EARFCNs, A1-A5/B1-B2 thresholds, time to trigger, gaps),
+ *       meas_report (modem reports a neighbour meeting a rule, usually just before a handover), handover /
+ *       handover_done (target, duration), rach (timing advance -> distance to the tower), reestablishment (radio
+ *       link failure)
+ *   RLM (0xB18A v1): out-of-sync BLER estimate and T310 (radio link failure timer running)
+ *   Modem temperature / supply voltage via AT (SIMCom AT+CPMUTEMP, Quectel AT+QTEMP; AT+CBC) every 5 s; NA if the
+ *   AT port is busy.
  *
- * Output: one line per interval, "SIM7600G-H;name=value<unit>;...", fields always in the same order, NA = no data.
- *   Event lines: ...;event=cell_change;... and on exit ...;event=summary;...   --table prints the old column view.
+ * Output: one line per interval, "<model>;name=value<unit>;...", fields always in the same order, NA = no data.
+ *   Event lines: ...;event=cell_change;..., the mobility events above, and on exit ...;event=summary;...
+ *   --table prints the old column view.
  *   The key=value lines are also sent over UDP to GROUND_IP from /etc/masina.conf, port 2224 (same as the SSC
  *   telemetry from masinatelemetry; the ground tells them apart by the first field). With DEBUG=2 in masina.conf
  *   they are also appended to /mnt/mmcblk0p1/modem_link_<date>_<time>.log if the SD card is mounted rw.
@@ -30,15 +47,18 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include "lte_common.h"
+#include "lte_rrc.h"
 
 static volatile sig_atomic_t stop;
 static void on_sig(int s) { (void)s; stop = 1; }
 
 static const char *HEADER =
     "         |---------------------------- downlink ----------------------------|"
-    "--------------------------- uplink ----------------------------|------ UL queue -------|  CSI          | modem   |\n"
+    "--------------------------- uplink ----------------------------|----------- UL grant / power -----------|"
+    "------ UL queue -------|  CSI          | modem   |\n"
     "time     |   TBs  BLER1st HARQretx    resid  MCS   RBs  MIMO%  Mbit |"
-    "    tx HARQretx       Mbit   RBs   mod  rate  pwr  pwr>23 | BSR KB qdly ms qmax PHR | CQI0/1    RI  | degC  V  | EARFCN PCI  RSRP0/1 dBm  diff   SNR0/1 dB    RSRQ  RSSI";
+    "    tx HARQretx       Mbit   RBs   mod  rate  pwr  pwr>23 |  NACK%  grant Mbit used%  txpwr  PL  f(i) |"
+    " buf KB qdly ms qmax PHR | CQI0/1    RI  | degC  V  | EARFCN PCI  RSRP0/1 dBm  diff   SNR0/1 dB    RSRQ  RSSI | nbPCI  RSRP  margin";
 
 /* modem temperature and supply voltage over AT, polled every HEALTH_PERIOD s */
 #define HEALTH_PERIOD 5
@@ -49,22 +69,26 @@ typedef struct {
     int temp, tmin, tmax;
     double volt, vmin, vmax;
     char model[64];
+    int quectel;
 } health_t;
 
-static void health_open(health_t *h, const char *port)
+static void health_open(health_t *h, const char *port, diag_t *d)
 {
     const char *c[] = { port, "/dev/ttyUSB2", "/dev/ttyUSB3" };
     h->fd = -1;
     h->last = -1e9;
     for (int i = port ? 0 : 1; i < 3 && h->fd < 0; i++)
         h->fd = tty_open(c[i]);
-    /* model from AT+CGMM, e.g. SIMCOM_SIM7600G-H -> SIM7600G-H */
+    /* model from AT+CGMM (SIMCOM_SIM7600G-H -> SIM7600G-H, EC25), else from the DIAG build id */
     char v[128];
-    snprintf(h->model, sizeof(h->model), "SIM7600G-H");
+    h->model[0] = 0;
     if (at_val(h->fd, "AT+CGMM", NULL, v, sizeof(v))) {
         const char *m = strncmp(v, "SIMCOM_", 7) ? v : v + 7;
         if (*m && !strchr(m, ' ') && !strchr(m, ':')) snprintf(h->model, sizeof(h->model), "%s", m);
     }
+    if (!h->model[0] && !diag_model(d, h->model, sizeof(h->model)))
+        snprintf(h->model, sizeof(h->model), "LTE");
+    h->quectel = is_quectel(h->model);
 }
 
 /* ---- key=value output: "MODEL;name=value<unit>;..." */
@@ -219,16 +243,17 @@ static void health_poll(health_t *h)
         return;
     h->last = now();
     char v[128];
-    int ht = at_val(h->fd, "AT+CPMUTEMP", "+CPMUTEMP", v, sizeof(v)) != NULL;
+    int ht = (h->quectel ? at_val(h->fd, "AT+QTEMP", "+QTEMP", v, sizeof(v))
+                         : at_val(h->fd, "AT+CPMUTEMP", "+CPMUTEMP", v, sizeof(v))) != NULL && parse_temp(v) > -1000;
     if (ht) {
-        h->temp = atoi(v);
+        h->temp = parse_temp(v);
         if (!h->have_t || h->temp < h->tmin) h->tmin = h->temp;
         if (!h->have_t || h->temp > h->tmax) h->tmax = h->temp;
         h->have_t = 1;
     }
-    int hv = at_val(h->fd, "AT+CBC", "+CBC", v, sizeof(v)) != NULL;
+    int hv = at_val(h->fd, "AT+CBC", "+CBC", v, sizeof(v)) != NULL && parse_volt(v) > 0;
     if (hv) {
-        h->volt = atof(v);
+        h->volt = parse_volt(v);
         if (!h->have_v || h->volt < h->vmin) h->vmin = h->volt;
         if (!h->have_v || h->volt > h->vmax) h->vmax = h->volt;
         h->have_v = 1;
@@ -257,6 +282,32 @@ static char *avg(char *o, const acc_t *a, int w)
     return o;
 }
 
+/* mobility events right away; time from the modem clock (+ offset to the host clock) with ms */
+static void print_events(mobility_t *m, const char *model, int table, double toff)
+{
+    for (int i = 0; i < m->nev; i++) {
+        double wt = now();  /* host receive time; modem clock only for durations (see lte_link.py) */
+        (void)toff;
+        time_t w = (time_t)wt;
+        char ts[32];
+        strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&w));
+        snprintf(ts + 8, sizeof(ts) - 8, ".%03d", (int)((wt - (double)w) * 1000));
+        if (!table) {
+            ll = snprintf(line, sizeof(line), "%s;time=%s;%s", model, ts, m->ev[i].kv);
+            kv_end();
+            continue;
+        }
+        /* "event=x;k=v;k=v" -> "x k=v k=v" */
+        const char *kv = m->ev[i].kv + 6;
+        size_t n = strcspn(kv, ";");
+        printf("*** %s %.*s", ts, (int)n, kv);
+        for (const char *p = kv + n; *p; p++) putchar(*p == ';' ? ' ' : *p);
+        putchar('\n');
+    }
+    m->nev = 0;
+    fflush(stdout);
+}
+
 int main(int argc, char **argv)
 {
     int table = 0, na = 0;
@@ -280,12 +331,18 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    int codes[] = { LOG_PDSCH & 0xfff, LOG_PUSCH & 0xfff, LOG_MAC_UL & 0xfff, LOG_CSI & 0xfff, LOG_MEAS & 0xfff };
-    if (diag_set_log_mask(&d, 0xB, codes, 5) < 0)
+    int codes[] = { LOG_PDSCH & 0xfff, LOG_PUSCH & 0xfff, LOG_MAC_UL & 0xfff, LOG_CSI & 0xfff, LOG_MEAS & 0xfff,
+                    LOG_UL_BUF & 0xfff, LOG_UL_TXST & 0xfff, LOG_PHICH & 0xfff, LOG_PUSCH_PC & 0xfff, LOG_RLC_DL & 0xfff,
+                    LOG_RLC_UL & 0xfff, LOG_PDCP_UL & 0xfff, LOG_NCELL & 0xfff, LOG_RLM & 0xfff, LOG_CONN_NB & 0xfff,
+                    LOG_RRC_OTA & 0xfff, LOG_RACH_TRIG & 0xfff, LOG_RACH_ATT & 0xfff };
+    int ok = -1;
+    for (int i = 0; i < 3 && ok < 0; i++)
+        ok = diag_set_log_mask(&d, 0xB, codes, sizeof(codes) / sizeof(codes[0]));
+    if (ok < 0)
         fprintf(stderr, "warning: no response to log mask command on %s (is it the DIAG port?)\n", port);
 
     static health_t hl;
-    health_open(&hl, args[2]);
+    health_open(&hl, args[2], &d);
     static masina_conf_t conf;
     if (!table)
         alink_open();
@@ -298,10 +355,16 @@ int main(int argc, char **argv)
     double vmin = 0, vmax = 0;
 
     static stats_t s;
+    static mobility_t mob;
+    double toff = 0;
+    int have_toff = 0;
     double tot_t = 0, peak_dl = 0, peak_ul = 0;
     long long tot_dl_bytes = 0, tot_ul_bytes = 0;
     long tot_dltb = 0, tot_first = 0, tot_fail = 0, tot_retx = 0, tot_resid = 0, tot_ultx = 0, tot_ulretx = 0, tot_pwrlim = 0, tot_qwarn = 0;
-    double tot_qmax = 0;
+    double tot_qmax = 0, tot_bufmax = 0, pl_min = 0, pl_max = 0;
+    long long tot_grx = 0, tot_gused = 0;
+    long tot_ack = 0, tot_nack = 0, tot_l2[L2_N] = { 0 }, tot_t310 = 0;
+    int have_pl = 0;
     int have_cell = 0, cell_e = 0, cell_p = 0;
     char b1[32], b2[32], b3[32], b4[32], b5[32], b6[32], b7[32], b8[32], b9[32], b10[32], b11[32], b12[32];
 
@@ -311,7 +374,14 @@ int main(int argc, char **argv)
         int code, len;
         const uint8_t *body;
         while (!stop && (len = diag_log(&d, end, &code, &body)) != -2) {
-            if (len >= 0) stats_dispatch(&s, code, body, len);
+            if (len < 0) continue;
+            double mts = diag_log_time(body), off = now() - mts;
+            if (!have_toff || off < toff) { toff = off; have_toff = 1; }
+            if (stats_dispatch(&s, code, body, len)) continue;
+            if (code == LOG_RRC_OTA) mob_rrc(&mob, mts, body, len);
+            else if (code == LOG_RACH_TRIG) mob_rach_trig(&mob, body, len);
+            else if (code == LOG_RACH_ATT) mob_rach_att(&mob, mts, body, len);
+            if (mob.nev) print_events(&mob, hl.model, table, toff);
         }
         double el = now() - t0;
         if (el <= 0) el = 1e-3;
@@ -352,10 +422,17 @@ int main(int argc, char **argv)
         char b13[32], qs[64];
         double qd = 0, qm = 0;
         int hq = stats_qdelay(&s, el, &qd, &qm);
-        int n0 = hq ? snprintf(qs, sizeof(qs), "%6.1f %6.0f%c %4.0f ", mean(&s.bsr) / 1000, qd, stats_queue_warn(&s, el) ? '!' : ' ', qm)
+        int n0 = hq ? snprintf(qs, sizeof(qs), "%6.1f %6.0f%c %4.0f ", mean(stats_queue(&s)) / 1000, qd,
+                               stats_queue_warn(&s, el) ? '!' : ' ', qm)
                     : snprintf(qs, sizeof(qs), "     -      -     -  ");
         snprintf(qs + n0, sizeof(qs) - n0, s.phr.n ? "%3.0f" : "  -", mean(&s.phr));
         if (hq) { if (qm > tot_qmax) tot_qmax = qm; tot_qwarn += stats_queue_warn(&s, el); }
+        long nph = s.ul_ack + s.ul_nack;
+        int bn = stats_best_nb(&s);
+        /* serving RSRP: 0xB179's filtered value, else the better antenna of 0xB193 */
+        int hm = bn >= 0 && (s.nb_srv.n > 0 || s.rf_valid);
+        double srv = s.nb_srv.n ? mean(&s.nb_srv) : s.rsrp0 > s.rsrp1 ? s.rsrp0 : s.rsrp1;
+        double margin = hm ? srv - mean(&s.nb[bn].rsrp) : 0;
         if (!table) {
             long ntb = s.ntb[1] + s.ntb[2], nri = s.ri[1] + s.ri[2];
             kv_start(hl.model);
@@ -369,20 +446,32 @@ int main(int argc, char **argv)
             kv_f("dl_rbs", s.rbs.n > 0, mean(&s.rbs), 1, "");
             kv_f("dl_mimo", ntb > 0, 100.0 * s.ntb[2] / (ntb ? ntb : 1), 0, "%");
             kv_f("dl_rate", 1, dlm, 2, "Mbps");
+            kv_f("pdcch_agg", s.pdcch_agg.n > 0, mean(&s.pdcch_agg), 2, "");
             kv_l("ul_tx", (long)s.ul_n);
             kv_l("ul_harq_retx", ulr);
             kv_f("ul_harq_retx_pct", s.ul_n > 0, 100.0 * ulr / (s.ul_n ? s.ul_n : 1), 1, "%");
+            kv_l("ul_nack", s.ul_nack);
+            kv_f("ul_nack_pct", nph > 0, 100.0 * s.ul_nack / (nph ? nph : 1), 1, "%");
             kv_f("ul_rate", 1, ulm, 2, "Mbps");
+            kv_f("ul_grant", 1, s.grant_rx * 8 / el / 1e6, 2, "Mbps");
+            kv_f("ul_grant_used", s.grant_rx > 0, 100.0 * s.grant_used / (s.grant_rx ? s.grant_rx : 1), 0, "%");
             kv_f("ul_rbs", s.ul_rb.n > 0, mean(&s.ul_rb), 1, "");
             kv_s("ul_mod", s.ul_n && m ? MODS[m] : "NA");
             kv_f("ul_coderate", s.ul_rate.n > 0, mean(&s.ul_rate), 2, "");
             kv_f("ul_pwr", s.ul_pwr.n > 0, mean(&s.ul_pwr), 1, "dBm");
+            kv_f("ul_txpwr", s.ul_txpwr.n > 0, mean(&s.ul_txpwr), 1, "dBm");
             kv_f("ul_pwrlim", s.ul_n > 0, 100.0 * s.ul_pwrlim / (s.ul_n ? s.ul_n : 1), 1, "%");
+            kv_f("ul_pc_corr", s.pc_corr.n > 0, mean(&s.pc_corr), 1, "dB");
+            kv_f("pathloss", s.pathloss.n > 0, mean(&s.pathloss), 1, "dB");
+            kv_f("ul_buf", s.ul_buf.n > 0, mean(&s.ul_buf) / 1000, 1, "KB");
+            kv_f("ul_buf_max", s.ul_buf.n > 0, s.ul_buf.max / 1000, 1, "KB");
             kv_f("bsr", s.bsr.n > 0, mean(&s.bsr) / 1000, 1, "KB");
             kv_f("qdelay", hq, qd, 0, "ms");
             kv_f("qdelay_max", hq, qm, 0, "ms");
             kv_l("qwarn", stats_queue_warn(&s, el));
             kv_f("phr", s.phr.n > 0, mean(&s.phr), 0, "dB");
+            for (int k = 0; k < L2_N; k++)
+                kv_f(L2_NAME[k], s.l2_valid, s.l2[k], 0, "");
             kv_f("cqi0", s.cqi.n > 0, mean(&s.cqi), 1, "");
             kv_f("cqi1", s.cqi1.n > 0, mean(&s.cqi1), 1, "");
             kv_f("ri", nri > 0, (s.ri[1] + 2.0 * s.ri[2]) / (nri ? nri : 1), 1, "");
@@ -397,17 +486,32 @@ int main(int argc, char **argv)
             kv_f("snr1", s.rf_valid, s.snr1, 1, "dB");
             kv_f("rsrq", s.rf_valid, s.rsrq, 1, "dB");
             kv_f("rssi", s.rf_valid, s.rssi, 1, "dBm");
+            kv_l("ncells", s.nnb);
+            kv_f("nb_earfcn", bn >= 0, bn >= 0 ? s.nb[bn].earfcn : 0, 0, "");
+            kv_f("nb_pci", bn >= 0, bn >= 0 ? s.nb[bn].pci : 0, 0, "");
+            kv_f("nb_rsrp", bn >= 0, bn >= 0 ? mean(&s.nb[bn].rsrp) : 0, 1, "dBm");
+            kv_f("nb_rsrq", bn >= 0 && s.nb[bn].rsrq.n > 0, bn >= 0 ? mean(&s.nb[bn].rsrq) : 0, 1, "dB");
+            kv_f("ho_margin", hm, margin, 1, "dB");
+            kv_f("rlm_oos", s.rlm_oos.n > 0, mean(&s.rlm_oos), 0, "%");
+            kv_f("t310", s.rlm_oos.n > 0, s.t310, 0, "");
             kv_end();
-        } else
-        printf("%s | %5ld  %s %5ld %s %4ld  %s %s %s %5.1f | %5zu %5ld %s %6.2f %s %5s %s %s %s | %s | %s/%s %s | %s | %s\n",
-               tm, s.dl_tb, pct(b1, s.dl_first_fail, s.dl_first), s.dl_retx, pct(b13, s.dl_retx, s.dl_tb), s.dl_resid,
-               avg(b2, &s.mcs, 4), avg(b3, &s.rbs, 5), pct(b4, s.ntb[2], s.ntb[1] + s.ntb[2]), dlm,
-               s.ul_n, ulr, pct(b5, ulr, s.ul_n), ulm, avg(b6, &s.ul_rb, 5), s.ul_n ? MODS[m] : "-",
-               s.ul_rate.n ? (sprintf(b7, "%5.2f", mean(&s.ul_rate)), b7) : "    -",
-               avg(b8, &s.ul_pwr, 4), pct(b9, s.ul_pwrlim, s.ul_n), qs,
-               avg(b10, &s.cqi, 4), avg(b11, &s.cqi1, 4),
-               s.ri[1] + s.ri[2] ? (sprintf(b12, "%4.1f", (s.ri[1] + 2.0 * s.ri[2]) / (s.ri[1] + s.ri[2])), b12) : "   -",
-               tv, rf);
+        } else {
+            char gs[96], ns[48], c1[16], c2[16], c3[16], c4[16], c5[16];
+            snprintf(gs, sizeof(gs), "%s %11.2f %s %s %s %s", pct(c1, s.ul_nack, nph), s.grant_rx * 8 / el / 1e6,
+                     pct(c2, s.grant_used, s.grant_rx), avg(c3, &s.ul_txpwr, 5),
+                     s.pathloss.n ? (sprintf(c4, "%4.0f", mean(&s.pathloss)), c4) : "   -", avg(c5, &s.pc_corr, 5));
+            if (hm) snprintf(ns, sizeof(ns), "%5d %6.1f %6.1f", s.nb[bn].pci, mean(&s.nb[bn].rsrp), margin);
+            else snprintf(ns, sizeof(ns), "    -      -      -");
+            printf("%s | %5ld  %s %5ld %s %4ld  %s %s %s %5.1f | %5zu %5ld %s %6.2f %s %5s %s %s %s | %s | %s | %s/%s %s | %s | %s | %s\n",
+                   tm, s.dl_tb, pct(b1, s.dl_first_fail, s.dl_first), s.dl_retx, pct(b13, s.dl_retx, s.dl_tb), s.dl_resid,
+                   avg(b2, &s.mcs, 4), avg(b3, &s.rbs, 5), pct(b4, s.ntb[2], s.ntb[1] + s.ntb[2]), dlm,
+                   s.ul_n, ulr, pct(b5, ulr, s.ul_n), ulm, avg(b6, &s.ul_rb, 5), s.ul_n ? MODS[m] : "-",
+                   s.ul_rate.n ? (sprintf(b7, "%5.2f", mean(&s.ul_rate)), b7) : "    -",
+                   avg(b8, &s.ul_pwr, 4), pct(b9, s.ul_pwrlim, s.ul_n), gs, qs,
+                   avg(b10, &s.cqi, 4), avg(b11, &s.cqi1, 4),
+                   s.ri[1] + s.ri[2] ? (sprintf(b12, "%4.1f", (s.ri[1] + 2.0 * s.ri[2]) / (s.ri[1] + s.ri[2])), b12) : "   -",
+                   tv, rf, ns);
+        }
         fflush(stdout);
 
         tot_t += el;
@@ -421,6 +525,19 @@ int main(int argc, char **argv)
         tot_ultx += s.ul_n;
         tot_ulretx += ulr;
         tot_pwrlim += s.ul_pwrlim;
+        tot_grx += s.grant_rx;
+        tot_gused += s.grant_used;
+        tot_ack += s.ul_ack;
+        tot_nack += s.ul_nack;
+        for (int k = 0; k < L2_N; k++) tot_l2[k] += s.l2[k];
+        tot_t310 += s.t310;
+        if (s.ul_buf.n && s.ul_buf.max > tot_bufmax) tot_bufmax = s.ul_buf.max;
+        if (s.pathloss.n) {
+            double pl = mean(&s.pathloss);
+            if (!have_pl || pl < pl_min) pl_min = pl;
+            if (!have_pl || pl > pl_max) pl_max = pl;
+            have_pl = 1;
+        }
         if (dlm > peak_dl) peak_dl = dlm;
         if (ulm > peak_ul) peak_ul = ulm;
         stats_reset(&s);
@@ -444,10 +561,29 @@ int main(int argc, char **argv)
         kv_f("ul_peak", 1, peak_ul, 2, "Mbps");
         kv_l("ul_harq_retx", tot_ulretx);
         kv_f("ul_harq_retx_pct", tot_ultx > 0, 100.0 * tot_ulretx / (tot_ultx ? tot_ultx : 1), 1, "%");
+        kv_l("ul_nack", tot_nack);
+        kv_f("ul_nack_pct", tot_ack + tot_nack > 0, 100.0 * tot_nack / (tot_ack + tot_nack ? tot_ack + tot_nack : 1), 1, "%");
         kv_f("ul_pwrlim", tot_ultx > 0, 100.0 * tot_pwrlim / (tot_ultx ? tot_ultx : 1), 1, "%");
+        kv_f("ul_grant_used", tot_grx > 0, 100.0 * tot_gused / (tot_grx ? tot_grx : 1), 1, "%");
+        kv_f("pathloss_min", have_pl, pl_min, 0, "dB");
+        kv_f("pathloss_max", have_pl, pl_max, 0, "dB");
+        kv_f("ul_buf_max", 1, tot_bufmax / 1000, 1, "KB");
         kv_f("qdelay_max", 1, tot_qmax, 0, "ms");
         kv_l("qwarn_intervals", tot_qwarn);
         kv_l("intervals", n_int);
+        kv_l("rlc_ul_retx", tot_l2[RLC_UL_RETX]);
+        kv_l("rlc_ul_nack", tot_l2[RLC_UL_NACK]);
+        kv_l("rlc_dl_retx", tot_l2[RLC_DL_RETX]);
+        kv_l("rlc_dl_nack", tot_l2[RLC_DL_NACK]);
+        kv_l("rlc_dl_drop", tot_l2[RLC_DL_DROP]);
+        kv_l("pdcp_ul_discard", tot_l2[PDCP_UL_DISCARD]);
+        kv_l("t310_intervals", tot_t310);
+        kv_l("rrc_setups", mob.counts[MOB_SETUP]);
+        kv_l("rrc_releases", mob.counts[MOB_RELEASE]);
+        kv_l("meas_reports", mob.counts[MOB_REPORT]);
+        kv_l("handovers", mob.counts[MOB_HO]);
+        kv_l("handovers_done", mob.counts[MOB_HO_DONE]);
+        kv_l("reestablishments", mob.counts[MOB_REEST]);
         kv_f("temp_min", seen_t, tmin, 0, "C");
         kv_f("temp_max", seen_t, tmax, 0, "C");
         kv_f("vbat_min", seen_v, vmin, 2, "V");
@@ -462,8 +598,19 @@ int main(int argc, char **argv)
     printf("UL: %.1f MB, avg %.1f / peak %.1f Mbit/s, HARQ retx %ld (%s of PUSCH), power-limited %s of PUSCH\n",
            tot_ul_bytes / 1e6, tot_ul_bytes * 8 / tot_t / 1e6, peak_ul, tot_ulretx, trim_pct(pct(b2, tot_ulretx, tot_ultx)),
            trim_pct(pct(b3, tot_pwrlim, tot_ultx)));
-    printf("UL queue: max delay %.0f ms, %ld of %.0f intervals with queue delay >= %d ms\n", tot_qmax, tot_qwarn,
-           tot_t / interval, QDELAY_WARN);
+    printf("UL HARQ NACK (PHICH) %s, grant used %s, path loss ", trim_pct(pct(b5, tot_nack, tot_ack + tot_nack)),
+           trim_pct(pct(b6, tot_gused, tot_grx)));
+    if (have_pl) printf("%.0f..%.0f dB\n", pl_min, pl_max);
+    else printf("-\n");
+    printf("UL queue: max %.0f KB, max delay %.0f ms, %ld of %ld intervals with queue delay >= %d ms\n", tot_bufmax / 1000,
+           tot_qmax, tot_qwarn, n_int, QDELAY_WARN);
+    printf("Mobility: %ld handovers (%ld completed), %ld measurement reports, %ld connection setups, %ld releases, "
+           "%ld re-establishments\n", mob.counts[MOB_HO], mob.counts[MOB_HO_DONE], mob.counts[MOB_REPORT],
+           mob.counts[MOB_SETUP], mob.counts[MOB_RELEASE], mob.counts[MOB_REEST]);
+    printf("RLC: UL retx %ld, NACK rx %ld; DL retx %ld, NACK tx %ld, dropped %ld, t-reordering expiries %ld; "
+           "PDCP UL discards %ld; T310 running in %ld intervals\n", tot_l2[RLC_UL_RETX], tot_l2[RLC_UL_NACK],
+           tot_l2[RLC_DL_RETX], tot_l2[RLC_DL_NACK], tot_l2[RLC_DL_DROP], tot_l2[RLC_DL_TREORD], tot_l2[PDCP_UL_DISCARD],
+           tot_t310);
     if (seen_t || seen_v)
         printf("Modem: temperature %d..%d degC, supply %.2f..%.2f V\n", tmin, tmax, vmin, vmax);
     return 0;

@@ -1,15 +1,16 @@
 /* Adaptive video bitrate over LTE, driven by the uplink queue that modem_link measures on the modem.
  *
  * modem_link sends each of its key=value lines to 127.0.0.1:2225 as well (the DIAG port can only have one reader).
- * modem_alink takes bsr (bytes waiting in the modem's uplink buffer), qdelay (bsr / uplink rate) and ul_rate from
- * them and sets the encoder bitrate over the camera's HTTP API (/api/v1/set?video0.bitrate=<kbit/s>). It decides on
- * every stats line, so it reacts as fast as modem_link's interval (0.25 s in S92modemlink).
+ * modem_alink takes the uplink queue (ul_buf: exact bytes waiting in the modem, or bsr where the modem does not log
+ * it), qdelay (queue / uplink rate) and ul_rate from them and sets the encoder bitrate over the camera's HTTP API
+ * (/api/v1/set?video0.bitrate=<kbit/s>). It decides on every stats line, so it reacts as fast as modem_link's interval
+ * (0.25 s in S92modemlink).
  *
  * How hard it reacts, and the highest bitrate it uses, come from a preset (table below):
  *   congested -> aim for a share of what the uplink carried, minus enough to empty the queue within `drain`
  *                seconds; while the bitrate is above that, cut to it (at least to down_factor of the bitrate, at most
  *                to cut_floor of it in one line). Once below it, hold: the queue is draining. Going by the rate rather
- *                than by whether the queue shrinks also works when the modem's report tops out at 150 KB.
+ *                than by whether the queue shrinks also works when only bsr is there, which tops out at 150 KB.
  *   clear     -> once clear for a while, go straight back to ul_share of what the uplink carried while congested
  *                (if that was in the last 10 s), then raise a small step per line (at least 25 kbit/s), up to the
  *                preset's max. After 10 s without congestion the link may carry more: at least 1 % of the max per
@@ -226,8 +227,8 @@ static int camera_set(const conf_t *c, const char *key, long value)
 
 /* ---- modem_link stats */
 typedef struct {
-    int has_qdelay, has_bsr, has_ul;
-    double qdelay, bsr, ul_rate; /* ms, KB, Mbit/s */
+    int has_qdelay, has_queue, has_ul;
+    double qdelay, queue, ul_rate; /* ms, KB, Mbit/s */
 } link_t;
 
 /* number after ";key=" in a modem_link line; 0 if missing or NA */
@@ -250,7 +251,7 @@ static int link_parse(const char *line, link_t *l)
     if (strstr(line, ";event=") || !strstr(line, ";qdelay="))
         return 0;
     l->has_qdelay = kv_num(line, "qdelay", &l->qdelay);
-    l->has_bsr = kv_num(line, "bsr", &l->bsr);
+    l->has_queue = kv_num(line, "ul_buf", &l->queue) || kv_num(line, "bsr", &l->queue); /* exact buffer if logged */
     l->has_ul = kv_num(line, "ul_rate", &l->ul_rate);
     return 1;
 }
@@ -264,7 +265,7 @@ typedef struct {
     int fps, fps_full; /* current frame rate, and the one to give back */
     int camera_ok;     /* -1 until the first poll, so the first failure is reported */
     int was_congested, stats_ok;
-    double last_bsr; /* KB on the previous stats line */
+    double last_queue; /* KB on the previous stats line */
     double last_change, clear_since, last_stats, fps_retry;
     double cap, cap_time; /* kbit/s the uplink carried on the last congested line, and when */
 } alink_t;
@@ -309,7 +310,7 @@ static void report(const alink_t *a, const char *reason, long prev, const link_t
     n += snprintf(line + n, sizeof(line) - n, ";prev=%ldkbps;reason=%s", prev, reason);
     if (l) {
         n += num_or_na(line + n, sizeof(line) - n, "qdelay", l->has_qdelay, l->qdelay, 0, "ms");
-        n += num_or_na(line + n, sizeof(line) - n, "bsr", l->has_bsr, l->bsr, 1, "KB");
+        n += num_or_na(line + n, sizeof(line) - n, "queue", l->has_queue, l->queue, 1, "KB");
         n += num_or_na(line + n, sizeof(line) - n, "ul_rate", l->has_ul, l->ul_rate, 2, "Mbps");
     }
     puts(line);
@@ -440,9 +441,9 @@ static void release(alink_t *a, const conf_t *c, const char *reason)
 static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
 {
     const preset_t *p = a->p;
-    int congested = l->has_bsr && ((l->has_qdelay && l->qdelay >= p->qdelay_high && l->bsr >= p->qbytes_min) ||
-                                   (p->qbytes_high > 0 && l->bsr >= p->qbytes_high));
-    int clear = !l->has_bsr || l->bsr < p->qbytes_clear || (l->has_qdelay && l->qdelay < p->qdelay_clear);
+    int congested = l->has_queue && ((l->has_qdelay && l->qdelay >= p->qdelay_high && l->queue >= p->qbytes_min) ||
+                                     (p->qbytes_high > 0 && l->queue >= p->qbytes_high));
+    int clear = !l->has_queue || l->queue < p->qbytes_clear || (l->has_qdelay && l->qdelay < p->qdelay_clear);
     if (a->current > p->max_bitrate) {
         apply(a, c, p->max_bitrate, "max", l); /* someone else set more than the preset allows */
     } else if (congested) {
@@ -452,12 +453,12 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
         if (l->has_ul) {
             a->cap = l->ul_rate * 1000; /* with a queue waiting, the modem sends all the link gives it */
             a->cap_time = t;
-            double aim = a->cap * p->ul_share - l->bsr * 8 / p->drain; /* kbit/s */
+            double aim = a->cap * p->ul_share - l->queue * 8 / p->drain; /* kbit/s */
             cut = a->current > aim;
             if (aim < target)
                 target = aim;
         } else
-            cut = !a->was_congested || l->bsr >= a->last_bsr; /* no rate: cut again only while the queue grows */
+            cut = !a->was_congested || l->queue >= a->last_queue; /* no rate: cut again only while the queue grows */
         if (target < a->current * p->cut_floor)
             target = a->current * p->cut_floor;
         if (cut && t - a->last_change >= MIN_GAP && apply(a, c, (long)target, "congestion", l))
@@ -479,7 +480,7 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
     } else
         a->clear_since = -1;
     a->was_congested = congested;
-    a->last_bsr = l->has_bsr ? l->bsr : 0;
+    a->last_queue = l->has_queue ? l->queue : 0;
     fps_update(a, c); /* also follows a bitrate someone else set */
 }
 

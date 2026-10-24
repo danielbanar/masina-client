@@ -1,5 +1,5 @@
 /* Shared code for modem_link / lte_info: Qualcomm DIAG transport, AT commands and
- * PHY/MAC log parsers for SIM7600 (MDM9x07). Plain C99 + POSIX, no dependencies. */
+ * PHY/MAC/RLC/PDCP log parsers for SIM7600 / Quectel EC25 (MDM9x07). Plain C99 + POSIX, no dependencies. */
 #ifndef LTE_COMMON_H
 #define LTE_COMMON_H
 #define _GNU_SOURCE
@@ -204,6 +204,13 @@ static int diag_log(diag_t *d, double deadline, int *code, const uint8_t **body)
     }
 }
 
+/* modem time (s, 1.25 ms resolution) of the log packet whose payload diag_log() returned */
+__attribute__((unused)) static double diag_log_time(const uint8_t *body)
+{
+    uint64_t ts = rd32(body - 8) | (uint64_t)rd32(body - 4) << 32;
+    return (ts >> 16) * 1.25e-3;
+}
+
 /* ------------------------------------------------------------------ AT */
 #define AT_MAXL 40
 typedef char at_lines[AT_MAXL][512];
@@ -280,12 +287,86 @@ __attribute__((unused)) static const char *at_val(int fd, const char *cmd, const
     return NULL;
 }
 
+/* model from the DIAG extended build id (e.g. EC25EUXGAR08A16M1G -> EC25); works while ModemManager holds AT */
+__attribute__((unused)) static int diag_model(diag_t *d, char *dst, size_t dsz)
+{
+    uint8_t c = 0x7c;
+    int l = diag_cmd(d, &c, 1, 2);
+    if (l <= 12) return 0;
+    char bid[128];
+    int n = l - 12 < (int)sizeof(bid) - 1 ? l - 12 : (int)sizeof(bid) - 1;
+    memcpy(bid, d->frame + 12, n);
+    bid[n] = 0;
+    if ((bid[0] == 'E' && strchr("CGM", bid[1]) && isdigit((unsigned char)bid[2]) && isdigit((unsigned char)bid[3])) ||
+        (bid[0] == 'B' && bid[1] == 'G' && isdigit((unsigned char)bid[2]))) {
+        snprintf(dst, dsz, "%.4s", bid);
+        return 1;
+    }
+    const char *m = strstr(bid, "SIM");
+    if (m && isdigit((unsigned char)m[3])) {
+        size_t k = 3;
+        while (m[k] && (isalnum((unsigned char)m[k]) || m[k] == '-')) k++;
+        snprintf(dst, dsz, "%.*s", (int)k, m);
+        return 1;
+    }
+    return 0;
+}
+
+/* Quectel (EC2x/EG/EM/BG/RM) vs SIMCom by model name */
+__attribute__((unused)) static int is_quectel(const char *model)
+{
+    return (model[0] == 'E' && strchr("CGM", model[1]) && isdigit((unsigned char)model[2])) ||
+           !strncmp(model, "BG", 2) || !strncmp(model, "RM", 2);
+}
+
+/* temperature: SIMCom "+CPMUTEMP: 33"; Quectel "+QTEMP: pmic,xo,pa" (hottest); -1000 if none */
+__attribute__((unused)) static int parse_temp(const char *v)
+{
+    int best = -1000;
+    for (const char *p = v; *p;) {
+        if (*p == '-' || isdigit((unsigned char)*p)) {
+            char *e;
+            long x = strtol(p, &e, 10);
+            if (x > -40 && x < 150 && x > best) best = x;
+            p = e;
+        } else
+            p++;
+    }
+    return best;
+}
+
+/* supply voltage: SIMCom "+CBC: 4.21V"; Quectel "+CBC: 0,0,3812" (mV); <0 if none */
+__attribute__((unused)) static double parse_volt(const char *v)
+{
+    const char *c = strrchr(v, ',');
+    double x = atof(c ? c + 1 : v);
+    return x > 100 ? x / 1000 : x > 0 ? x : -1;
+}
+
 /* ------------------------------------------------------------------ PHY/MAC log parsers */
 #define LOG_PDSCH  0xB173  /* LTE PHY PDSCH stat indication v5 */
 #define LOG_PUSCH  0xB139  /* LTE LL1 PUSCH tx report v25 */
 #define LOG_MAC_UL 0xB064  /* LTE MAC UL transport block */
 #define LOG_CSI    0xB14D  /* LTE PHY PUCCH CSI report v24 */
 #define LOG_MEAS   0xB193  /* LTE ML1 serving cell meas response */
+#define LOG_UL_BUF   0xB066  /* LTE MAC UL buffer status internal (subpacket v5): exact bytes queued, per subframe */
+#define LOG_UL_TXST  0xB067  /* LTE MAC UL Tx statistics: grant bytes received / used per 100 subframes */
+#define LOG_RLC_DL   0xB087  /* LTE RLC DL statistics (subpacket v3), cumulative per radio bearer */
+#define LOG_RLC_UL   0xB097  /* LTE RLC UL statistics (subpacket v1) */
+#define LOG_PDCP_UL  0xB0B4  /* LTE PDCP UL statistics (subpacket v3) */
+#define LOG_PHICH    0xB16B  /* LTE PDCCH-PHICH indication report v5: UL HARQ ACK/NACK, PDCCH aggregation level */
+#define LOG_PUSCH_PC 0xB16E  /* LTE PUSCH power control v5: actual tx power, path loss, closed-loop f(i) */
+#define LOG_NCELL    0xB179  /* LTE ML1 connected mode intra-frequency measurement v4: neighbour cells */
+#define LOG_RLM      0xB18A  /* LTE PHY radio link monitoring v1: out-of-sync BLER, T310 */
+#define LOG_CONN_NB  0xB195  /* LTE ML1 connected neighbour meas request/response: all measured frequencies */
+#define LOG_RRC_OTA  0xB0C0  /* LTE RRC OTA message (lte_rrc.h) */
+#define LOG_RACH_TRIG 0xB061 /* LTE MAC RACH trigger */
+#define LOG_RACH_ATT 0xB062  /* LTE MAC RACH attempt */
+
+/* RLC/PDCP counters (increase over the interval, all radio bearers) */
+enum { RLC_UL_RETX, RLC_UL_NACK, RLC_UL_TPOLL, RLC_DL_RETX, RLC_DL_NACK, RLC_DL_DROP, RLC_DL_TREORD, PDCP_UL_DISCARD, L2_N };
+__attribute__((unused)) static const char *L2_NAME[L2_N] = { "rlc_ul_retx", "rlc_ul_nack", "rlc_ul_tpoll", "rlc_dl_retx",
+    "rlc_dl_nack", "rlc_dl_drop", "rlc_dl_treord", "pdcp_ul_discard" };
 
 typedef struct {
     struct { uint8_t valid, ndi, ok; } harq[16][2];  /* persists across resets */
@@ -307,6 +388,22 @@ typedef struct {
     uint32_t earfcn;
     int pci;
     double rsrp0, rsrp1, snr0, snr1, rsrq, rssi;
+    acc_t ul_buf;                    /* exact UL buffer bytes, one sample per subframe */
+    long long grant_rx, grant_used;  /* UL grant bytes from the eNB / used */
+    long ul_ack, ul_nack;            /* PHICH */
+    acc_t pdcch_agg, ul_txpwr, pathloss, pc_corr;
+    int l2_valid;                    /* an RLC/PDCP statistics packet arrived in this interval */
+    long l2[L2_N];
+    acc_t nb_srv;                    /* serving RSRP as seen by the neighbour measurement */
+    struct { unsigned earfcn; int pci; acc_t rsrp, rsrq; } nb[16];  /* neighbours, all measured frequencies */
+    int nnb;
+    int have_srv_cell, srv_pci;      /* serving cell as seen by 0xB179 */
+    unsigned srv_earfcn;
+    acc_t rlm_oos;
+    int t310;
+    /* persist across resets: last cumulative RLC/PDCP counters per (log code, radio bearer) */
+    struct { int code, rb; uint32_t v[4]; } l2_last[16];
+    int nl2;
 } stats_t;
 
 __attribute__((unused)) static void stats_reset(stats_t *s)
@@ -314,9 +411,14 @@ __attribute__((unused)) static void stats_reset(stats_t *s)
     uint16_t *tx = s->ul_tx;
     size_t cap = s->ul_cap;
     __typeof__(s->harq) h;
+    __typeof__(s->l2_last) l2;
+    int nl2 = s->nl2;
     memcpy(h, s->harq, sizeof(h));
+    memcpy(l2, s->l2_last, sizeof(l2));
     memset(s, 0, sizeof(*s));
     memcpy(s->harq, h, sizeof(h));
+    memcpy(s->l2_last, l2, sizeof(l2));
+    s->nl2 = nl2;
     s->ul_tx = tx;
     s->ul_cap = cap;
 }
@@ -480,25 +582,216 @@ static void stats_meas(stats_t *s, const uint8_t *b, int len)
     s->pci = w[1] & 0x1ff;
 }
 
-/* synchronous FDD HARQ: retransmission = PUSCH with no new MAC TB, 8 ms after a previous tx */
-/* uplink queue delay in ms (mean and max BSR / uplink rate); returns 0 if no BSR was reported */
+/* ---- extra MAC/RLC/PDCP/PHY items (Qualcomm MDM9x07, verified on Quectel EC25) */
+
+/* subpackets of a MAC/RLC/PDCP log packet (header: ver, count, 2 reserved; size field includes its own 4-byte header) */
+typedef struct { const uint8_t *b; int len, i, pos; } subpkt_it;
+
+static int subpkt_next(subpkt_it *it, int *ver, const uint8_t **p, int *pl)
+{
+    if (it->len < 2 || it->i >= it->b[1] || it->pos + 4 > it->len) return 0;
+    int sz = rd16(it->b + it->pos + 2);
+    if (sz < 4 || sz > it->len - it->pos) sz = it->len - it->pos;
+    *ver = it->b[it->pos + 1];
+    *p = it->b + it->pos + 4;
+    *pl = sz - 4;
+    it->pos += sz;
+    it->i++;
+    return 1;
+}
+
+static void stats_ul_buf(stats_t *s, const uint8_t *b, int len)
+{
+    int ver, pl;
+    const uint8_t *p;
+    subpkt_it it = { b, len, 0, 4 };
+    while (subpkt_next(&it, &ver, &p, &pl)) {
+        if (ver != 5 || pl < 1) continue;
+        for (int k = 0, q = 1; k < p[0] && q + 3 <= pl; k++) {
+            int nl = p[q + 2];
+            double tot = 0;
+            q += 3;
+            for (int j = 0; j < nl && q + 16 <= pl; j++, q += 16)  /* lcid, prio, new (2 fields), retx, ctrl bytes */
+                tot += (double)rd32(p + q + 2) + rd32(p + q + 6) + rd32(p + q + 10) + rd16(p + q + 14);
+            acc(&s->ul_buf, tot);
+        }
+    }
+}
+
+static void stats_ul_txst(stats_t *s, const uint8_t *b, int len)
+{
+    if (len < 21 || b[5] != 1) return;
+    uint32_t rx = rd32(b + 13), used = rd32(b + 17);
+    if (used <= rx) { s->grant_rx += rx; s->grant_used += used; }
+}
+
+static void stats_phich(stats_t *s, const uint8_t *b, int len)
+{
+    if (len < 4 || b[0] != 5) return;
+    for (int i = 0; i < b[3] && 4 + 40 * (i + 1) <= len; i++) {
+        const uint8_t *r = b + 4 + 40 * i;
+        uint32_t w0 = rd32(r), w1 = rd32(r + 4);
+        if (w0 >> 17 & 1) {  /* PHICH received for an earlier PUSCH */
+            if (w1 >> 4 & 1) s->ul_ack++;
+            else s->ul_nack++;
+        }
+        for (int k = 0; k < (int)(w0 & 7); k++)
+            acc(&s->pdcch_agg, 1 << (r[9 + 4 * k] >> 6 & 3));
+    }
+}
+
+static void stats_pusch_pc(stats_t *s, const uint8_t *b, int len)
+{
+    if (len < 4 || b[0] != 5) return;
+    for (int i = 0; i < b[3] && 4 + 12 * (i + 1) <= len; i++) {
+        const uint8_t *r = b + 4 + 12 * i;
+        uint32_t w1 = rd32(r + 4), w2 = rd32(r + 8);
+        int fi = w2 & 1023, act = w2 >> 15 & 255;
+        acc(&s->ul_txpwr, act > 127 ? act - 256 : act);
+        acc(&s->pathloss, w1 >> 22 & 255);
+        acc(&s->pc_corr, fi >= 512 ? fi - 1024 : fi);
+    }
+}
+
+typedef struct { int idx, off1, off2; } l2cnt_t;  /* counter, payload offsets of the u32 value(s) summed (-1 = none) */
+static const l2cnt_t RLC_DL_C[] = { { RLC_DL_RETX, 42, -1 }, { RLC_DL_NACK, 110, 114 }, { RLC_DL_DROP, 66, 78 }, { RLC_DL_TREORD, 118, -1 } };
+static const l2cnt_t RLC_UL_C[] = { { RLC_UL_RETX, 30, -1 }, { RLC_UL_NACK, 42, 46 }, { RLC_UL_TPOLL, 58, -1 } };
+static const l2cnt_t PDCP_UL_C[] = { { PDCP_UL_DISCARD, 53, -1 } };
+
+/* counters are cumulative per radio bearer: add the increase since the previous packet */
+static void stats_l2(stats_t *s, int code, const uint8_t *b, int len)
+{
+    int want, hdr, size, nc, ver, pl;
+    const l2cnt_t *c;
+    const uint8_t *p;
+    if (code == LOG_RLC_DL) { want = 3; hdr = 9; size = 262; c = RLC_DL_C; nc = 4; }
+    else if (code == LOG_RLC_UL) { want = 1; hdr = 5; size = 126; c = RLC_UL_C; nc = 3; }
+    else { want = 3; hdr = 5; size = 253; c = PDCP_UL_C; nc = 1; }
+    subpkt_it it = { b, len, 0, 4 };
+    while (subpkt_next(&it, &ver, &p, &pl)) {
+        if (ver != want || pl < 1) continue;
+        for (int r = 0; r < p[0] && hdr + size * (r + 1) <= pl; r++) {
+            const uint8_t *q = p + hdr + size * r;
+            uint32_t v[4] = { 0 };
+            int j;
+            for (int k = 0; k < nc; k++)
+                v[k] = rd32(q + c[k].off1) + (c[k].off2 >= 0 ? rd32(q + c[k].off2) : 0);
+            for (j = 0; j < s->nl2 && !(s->l2_last[j].code == code && s->l2_last[j].rb == q[0]); j++) ;
+            if (j < s->nl2) {
+                for (int k = 0; k < nc; k++) {
+                    uint32_t last = s->l2_last[j].v[k];
+                    s->l2[c[k].idx] += v[k] >= last ? v[k] - last : v[k];  /* smaller: bearer re-established */
+                }
+            } else if (s->nl2 < 16)
+                j = s->nl2++;
+            else
+                continue;
+            s->l2_last[j].code = code;
+            s->l2_last[j].rb = q[0];
+            memcpy(s->l2_last[j].v, v, sizeof(v));
+        }
+        s->l2_valid = 1;
+    }
+}
+
+/* rsrq < -29.99: not measured (raw 0, weak cell) */
+static void stats_add_nb(stats_t *s, unsigned earfcn, int pci, double rsrp, double rsrq)
+{
+    int j;
+    for (j = 0; j < s->nnb && !(s->nb[j].pci == pci && s->nb[j].earfcn == earfcn); j++) ;
+    if (j == s->nnb) {
+        if (s->nnb == 16) return;
+        s->nb[j].earfcn = earfcn;
+        s->nb[s->nnb++].pci = pci;
+    }
+    acc(&s->nb[j].rsrp, rsrp);
+    if (rsrq > -29.99) acc(&s->nb[j].rsrq, rsrq);
+}
+
+/* 0xB179 v4: intra-frequency neighbours (L3 filtered, the values handover events are evaluated on) */
+static void stats_ncell(stats_t *s, const uint8_t *b, int len)
+{
+    if (len < 28 || b[0] != 4) return;
+    unsigned earfcn = rd32(b + 8);
+    int spci = rd16(b + 12) & 0x1ff;
+    s->have_srv_cell = 1;
+    s->srv_earfcn = earfcn;
+    s->srv_pci = spci;
+    acc(&s->nb_srv, (int16_t)rd16(b + 16) / 16.0 - 180);
+    for (int i = 0; i < b[24] && 28 + 12 * (i + 1) <= len; i++) {
+        const uint8_t *r = b + 28 + 12 * i;
+        int pci = rd16(r) & 0x1ff;
+        if (pci != spci)
+            stats_add_nb(s, earfcn, pci, (int16_t)rd16(r + 2) / 16.0 - 180, (rd16(r + 6) & 0xfff) / 16.0 - 30);
+    }
+}
+
+/* 0xB195 subpacket 31 v3/v4: neighbours on every measured frequency (incl. inter-frequency during gaps) */
+static void stats_conn_nb(stats_t *s, const uint8_t *b, int len)
+{
+    int ver, pl;
+    const uint8_t *p;
+    if (len < 4 || b[0] != 1) return;
+    unsigned se = s->have_srv_cell ? s->srv_earfcn : s->earfcn;
+    int sp = s->have_srv_cell ? s->srv_pci : s->pci, have = s->have_srv_cell || s->rf_valid;
+    subpkt_it it = { b, len, 0, 4 };
+    while (subpkt_next(&it, &ver, &p, &pl)) {
+        int sid = p[-4];
+        if (sid != 31 || (ver != 3 && ver != 4) || pl < 8) continue;
+        unsigned earfcn = ver == 4 ? rd32(p) : rd16(p);
+        int nc = rd16(p + (ver == 4 ? 4 : 2)) & 63, q = ver == 4 ? 8 : 4;
+        for (int i = 0; i < nc && q + 52 * (i + 1) <= pl; i++) {
+            const uint8_t *c = p + q + 52 * i;
+            int pci = rd32(c) & 1023;
+            if (have && earfcn == se && pci == sp) continue;
+            stats_add_nb(s, earfcn, pci, (rd16(c + 12) & 4095) / 16.0 - 180, (rd32(c + 20) >> 10 & 1023) / 16.0 - 30);
+        }
+    }
+}
+
+static void stats_rlm(stats_t *s, const uint8_t *b, int len)
+{
+    if (len < 4 || b[0] != 1) return;
+    for (int i = 0; i < b[3] && 4 + 12 * (i + 1) <= len; i++) {
+        const uint8_t *r = b + 4 + 12 * i;
+        acc(&s->rlm_oos, rd16(r + 2));
+        s->t310 |= r[8] & 1;
+    }
+}
+
+/* strongest neighbour cell index in s->nb, -1 if none */
+__attribute__((unused)) static int stats_best_nb(const stats_t *s)
+{
+    int b = -1;
+    for (int j = 0; j < s->nnb; j++)
+        if (s->nb[j].rsrp.n && (b < 0 || mean(&s->nb[j].rsrp) > mean(&s->nb[b].rsrp))) b = j;
+    return b;
+}
+
+/* UL queue samples: exact buffer (0xB066) if logged, else the BSR the modem reports to the eNB */
+static const acc_t *stats_queue(const stats_t *s) { return s->ul_buf.n ? &s->ul_buf : &s->bsr; }
+
+/* uplink queue delay in ms (mean and max queued bytes / uplink rate); returns 0 if nothing was reported */
 #define QDELAY_WARN 50     /* ms: queue building up, UDP loss followed 1-2 s later in tests */
 #define QBYTES_WARN 10000  /* and at least this much queued: on a near-idle link small bursts look like delay */
 static int stats_qdelay(const stats_t *s, double el, double *mean_ms, double *max_ms)
 {
-    if (!s->bsr.n) return 0;
+    const acc_t *q = stats_queue(s);
+    if (!q->n) return 0;
     double rate = s->ul_bytes / el;
     if (rate < 0.5e6 / 8) rate = 0.5e6 / 8;  /* floor 0.5 Mbit/s so an idle link doesn't divide by ~0 */
-    *mean_ms = mean(&s->bsr) / rate * 1000;
-    *max_ms = s->bsr.max / rate * 1000;
+    *mean_ms = mean(q) / rate * 1000;
+    *max_ms = q->max / rate * 1000;
     return 1;
 }
 
 __attribute__((unused)) static int stats_queue_warn(const stats_t *s, double el)
 {
     double qd, qm;
-    return stats_qdelay(s, el, &qd, &qm) && qd >= QDELAY_WARN && mean(&s->bsr) >= QBYTES_WARN;
+    return stats_qdelay(s, el, &qd, &qm) && qd >= QDELAY_WARN && mean(stats_queue(s)) >= QBYTES_WARN;
 }
+
+/* synchronous FDD HARQ: retransmission = PUSCH with no new MAC TB, 8 ms after a previous tx */
 
 static long stats_ul_retx(const stats_t *s)
 {
@@ -519,6 +812,14 @@ static int stats_dispatch(stats_t *s, int code, const uint8_t *b, int len)
     case LOG_MAC_UL: stats_mac_ul(s, b, len); return 1;
     case LOG_CSI: stats_csi(s, b, len); return 1;
     case LOG_MEAS: stats_meas(s, b, len); return 1;
+    case LOG_UL_BUF: stats_ul_buf(s, b, len); return 1;
+    case LOG_UL_TXST: stats_ul_txst(s, b, len); return 1;
+    case LOG_PHICH: stats_phich(s, b, len); return 1;
+    case LOG_PUSCH_PC: stats_pusch_pc(s, b, len); return 1;
+    case LOG_RLC_DL: case LOG_RLC_UL: case LOG_PDCP_UL: stats_l2(s, code, b, len); return 1;
+    case LOG_NCELL: stats_ncell(s, b, len); return 1;
+    case LOG_RLM: stats_rlm(s, b, len); return 1;
+    case LOG_CONN_NB: stats_conn_nb(s, b, len); return 1;
     }
     return 0;
 }
