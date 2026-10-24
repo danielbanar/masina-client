@@ -22,6 +22,17 @@
  *                step while still within those 10 s, it is where the link congested), up to the preset's max. After 10 s without congestion the link may carry more: at least 1 % of the max per
  *                line. Nothing queued counts as clear.
  *   otherwise -> hold.
+ * The network's own rules (modem_link's trigger fields: the measurement rule closest to firing) say when the link is
+ * about to change:
+ *   edge      -> a rule within 2 dB of firing (A2 band search, A3/A5 handover, the last-resort A2 before a release;
+ *                not A1, the signal getting better): no raising, the link it would probe is about to go. Cuts still
+ *                happen, at the cell edge the uplink is short of transmit power.
+ *   handover  -> for 1 s after the serving cell changes (a handover, or service back after a release) no cut: the
+ *                queue the switch built drains on the new cell, which is usually the better one.
+ *   no service-> no serving cell (radio link lost, released): no raising. The queue fields are NA then, which the
+ *                interval-average fallback would read as clear.
+ * Each is reported once when it starts (reason=edge / handover / no_service / service).
+ *
  * Below 1 Mbit/s the frame rate goes down as well (/api/v1/set?video0.fps=): 40, 30, then 20 fps, so each frame keeps
  * about the bits it had at 1 Mbit/s and 60 fps. It also lowers the real floor: at 60 fps the encoder sends ~150 kbit/s
  * however low the bitrate is set.
@@ -68,6 +79,8 @@
 #define GET_EVERY 3.0     /* s between camera polls */
 #define STATS_TIMEOUT 3.0 /* s without stats before reporting no_data */
 #define HTTP_TIMEOUT 1    /* s */
+#define EDGE_GAP 2.0      /* dB: a network rule this close to firing (search, handover, release): no raising */
+#define HO_GRACE 1.0      /* s after a cell change without cuts: the queue the switch built drains on the new cell */
 
 /* ---- presets */
 typedef struct {
@@ -235,9 +248,12 @@ static int camera_set(const conf_t *c, const char *key, long value)
 
 /* ---- modem_link stats */
 typedef struct {
-    int has_qdelay, has_queue, has_ul, has_standing;
+    int has_qdelay, has_queue, has_ul, has_standing, has_trigger, has_cell;
     double qdelay, queue, ul_rate; /* ms, KB, Mbit/s */
     double qdelay_min, queue_min;  /* standing queue: smallest of the interval, ms and KB */
+    char trigger[48];              /* network rule closest to firing ("A2", "A5@1875/3500/6400") ... */
+    double trigger_gap;            /* ... dB before its condition holds (<= 0: holds) */
+    double earfcn, pci;            /* serving cell */
 } link_t;
 
 /* number after ";key=" in a modem_link line; 0 if missing or NA */
@@ -254,6 +270,22 @@ static int kv_num(const char *line, const char *key, double *v)
     return end != p;
 }
 
+/* text after ";key=" up to the next ';'; 0 if missing or NA */
+static int kv_str(const char *line, const char *key, char *o, size_t size)
+{
+    char pat[32];
+    snprintf(pat, sizeof(pat), ";%s=", key);
+    const char *p = strstr(line, pat);
+    if (!p)
+        return 0;
+    p += strlen(pat);
+    int n = (int)strcspn(p, ";\r\n");
+    if (!n || (n == 2 && !strncmp(p, "NA", 2)))
+        return 0;
+    snprintf(o, size, "%.*s", n, p);
+    return 1;
+}
+
 /* interval lines only: event lines (cell_change, summary) carry no queue stats */
 static int link_parse(const char *line, link_t *l)
 {
@@ -265,6 +297,8 @@ static int link_parse(const char *line, link_t *l)
     l->has_standing = kv_num(line, "qdelay_min", &l->qdelay_min);
     if (l->has_standing && !kv_num(line, "ul_buf_min", &l->queue_min)) /* only bsr on this modem: back from the delay */
         l->queue_min = l->qdelay_min / 1000 * (l->has_ul && l->ul_rate > 0.5 ? l->ul_rate : 0.5) * 1000 / 8; /* KB */
+    l->has_trigger = kv_str(line, "trigger", l->trigger, sizeof(l->trigger)) && kv_num(line, "trigger_gap", &l->trigger_gap);
+    l->has_cell = kv_num(line, "earfcn", &l->earfcn) && kv_num(line, "pci", &l->pci);
     return 1;
 }
 
@@ -280,6 +314,9 @@ typedef struct {
     double last_queue; /* KB on the previous stats line */
     double last_change, clear_since, last_stats, fps_retry;
     double cap, cap_time; /* kbit/s the uplink carried on the last congested line, and when */
+    int edge;             /* a network rule is close to firing (EDGE_GAP) */
+    int cell;             /* serving cell: 0 not seen yet, 1 there (earfcn, pci), 2 lost */
+    double earfcn, pci, grace_until;
 } alink_t;
 
 static int udp_fd = -1;
@@ -326,6 +363,8 @@ static void report(const alink_t *a, const char *reason, long prev, const link_t
         n += num_or_na(line + n, sizeof(line) - n, "ul_rate", l->has_ul, l->ul_rate, 2, "Mbps");
         n += num_or_na(line + n, sizeof(line) - n, "qdelay_min", l->has_standing, l->qdelay_min, 0, "ms");
         n += num_or_na(line + n, sizeof(line) - n, "queue_min", l->has_standing, l->queue_min, 1, "KB");
+        n += snprintf(line + n, sizeof(line) - n, ";trigger=%s", l->has_trigger ? l->trigger : "NA");
+        n += num_or_na(line + n, sizeof(line) - n, "trigger_gap", l->has_trigger, l->trigger_gap, 1, "dB");
     }
     puts(line);
     fflush(stdout);
@@ -452,9 +491,33 @@ static void release(alink_t *a, const conf_t *c, const char *reason)
     report(a, reason, prev, NULL);
 }
 
+/* the network's view of the link from modem_link's trigger and serving cell: sets a->edge, a->cell, a->grace_until */
+static void link_state(alink_t *a, const link_t *l, double t)
+{
+    /* entered at EDGE_GAP, left 1 dB above it so a gap hovering at the threshold does not report on every line */
+    int edge = l->has_trigger && strncmp(l->trigger, "A1", 2) && l->trigger_gap <= EDGE_GAP + (a->edge ? 1 : 0);
+    if (edge && !a->edge)
+        report(a, "edge", a->current, l);
+    a->edge = edge;
+    if (l->has_cell) {
+        if (a->cell == 2 || (a->cell == 1 && (l->earfcn != a->earfcn || l->pci != a->pci))) {
+            a->grace_until = t + HO_GRACE;
+            report(a, a->cell == 2 ? "service" : "handover", a->current, l);
+        }
+        a->cell = 1;
+        a->earfcn = l->earfcn;
+        a->pci = l->pci;
+    } else if (a->cell == 1) {
+        a->cell = 2;
+        report(a, "no_service", a->current, l);
+    }
+}
+
 static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
 {
     const preset_t *p = a->p;
+    link_state(a, l, t);
+    int grace = t < a->grace_until, hold_up = a->edge || grace || a->cell == 2;
     int congested, clear;
     double drain_kb; /* what has to be drained: the standing queue (a keyframe spike drains by itself) */
     if (l->has_standing) {
@@ -485,12 +548,12 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
             cut = !a->was_congested || drain_kb >= a->last_queue; /* no rate: cut again only while the queue grows */
         if (target < a->current * p->cut_floor)
             target = a->current * p->cut_floor;
-        if (cut && t - a->last_change >= MIN_GAP && apply(a, c, (long)target, "congestion", l))
+        if (cut && !grace && t - a->last_change >= MIN_GAP && apply(a, c, (long)target, "congestion", l))
             a->last_change = t;
     } else if (clear) {
         if (a->clear_since < 0)
             a->clear_since = t;
-        if (a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP) {
+        if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP) {
             long step = (long)(a->current * p->up_step);
             if (t - a->cap_time >= CAP_VALID && step < p->max_bitrate * PROBE_STEP)
                 step = (long)(p->max_bitrate * PROBE_STEP);

@@ -22,6 +22,10 @@
  *       PDCP discards, increase over the interval (NA = no statistics packet in the interval, they come every ~1.3 s)
  *   Neighbours (0xB179 v4 intra-frequency, 0xB195 every measured frequency): count, strongest EARFCN/PCI/RSRP/RSRQ,
  *       handover margin = serving - best neighbour RSRP
+ *   Trigger: the network's measurement rule closest to firing (trigger=A2 / A5@1875/3500/6400 ...), trigger_gap =
+ *       dB the signal can still move before its condition holds (<= 0: holds), trigger_nb = the neighbour it
+ *       compares (NA: not measured, a cell on another band is only measured during gaps), trigger_held = ms the
+ *       condition has held against trigger_ttt (the report goes out at ttt); see trig_eval in lte_common.h
  *   Mobility events, printed when they happen (RRC 0xB0C0 via lte_rrc.h, RACH 0xB061/0xB062): rrc_setup / rrc_release,
  *       meas_config (the network's handover rules: measured EARFCNs, A1-A5/B1-B2 thresholds, time to trigger, gaps),
  *       meas_report (modem reports a neighbour meeting a rule, usually just before a handover), handover /
@@ -59,7 +63,7 @@ static const char *HEADER =
     "------ UL queue -------|  CSI          | modem   |\n"
     "time     |   TBs  BLER1st HARQretx    resid  MCS   RBs  MIMO%  Mbit |"
     "    tx HARQretx       Mbit   RBs   mod  rate  pwr  pwr>23 |  NACK%  grant Mbit used%  txpwr  PL  f(i) |"
-    " buf KB qdly ms qmax PHR | CQI0/1    RI  | degC  V  | EARFCN PCI  RSRP0/1 dBm  diff   SNR0/1 dB    RSRQ  RSSI | nbPCI  RSRP  margin";
+    " buf KB qdly ms qmax PHR | CQI0/1    RI  | degC  V  | EARFCN PCI  RSRP0/1 dBm  diff   SNR0/1 dB    RSRQ  RSSI | nbPCI  RSRP  margin | trigger             gap";
 
 /* modem temperature and supply voltage over AT, polled every HEALTH_PERIOD s */
 #define HEALTH_PERIOD 5
@@ -357,6 +361,7 @@ int main(int argc, char **argv)
 
     static stats_t s;
     static mobility_t mob;
+    static trig_t trig;
     double toff = 0;
     int have_toff = 0;
     double tot_t = 0, peak_dl = 0, peak_ul = 0;
@@ -378,6 +383,7 @@ int main(int argc, char **argv)
             if (len < 0) continue;
             double mts = diag_log_time(body), off = now() - mts;
             if (!have_toff || off < toff) { toff = off; have_toff = 1; }
+            if (trig_feed(&trig, code, mts, body, len)) trig_eval(&trig, mob.have_rules ? mob.rules : NULL, mts);
             if (stats_dispatch(&s, code, body, len)) continue;
             if (code == LOG_RRC_OTA) mob_rrc(&mob, mts, body, len);
             else if (code == LOG_RACH_TRIG) mob_rach_trig(&mob, body, len);
@@ -434,6 +440,7 @@ int main(int argc, char **argv)
         int hm = bn >= 0 && (s.nb_srv.n > 0 || s.rf_valid);
         double srv = s.nb_srv.n ? mean(&s.nb_srv) : s.rsrp0 > s.rsrp1 ? s.rsrp0 : s.rsrp1;
         double margin = hm ? srv - mean(&s.nb[bn].rsrp) : 0;
+        trig_interval(&trig, mob.have_rules ? mob.rules : NULL);
         if (!table) {
             long ntb = s.ntb[1] + s.ntb[2], nri = s.ri[1] + s.ri[2];
             kv_start(hl.model);
@@ -496,17 +503,24 @@ int main(int argc, char **argv)
             kv_f("nb_rsrp", bn >= 0, bn >= 0 ? mean(&s.nb[bn].rsrp) : 0, 1, "dBm");
             kv_f("nb_rsrq", bn >= 0 && s.nb[bn].rsrq.n > 0, bn >= 0 ? mean(&s.nb[bn].rsrq) : 0, 1, "dB");
             kv_f("ho_margin", hm, margin, 1, "dB");
+            kv_s("trigger", trig.valid ? trig.name : "NA");
+            kv_f("trigger_gap", trig.valid, trig.gap, 1, "dB");
+            kv_f("trigger_nb", trig.valid && trig.have_nb, trig.nb_val, 1, trig.nb_q ? "dB" : "dBm");
+            kv_f("trigger_held", trig.valid, trig.held, 0, "ms");
+            kv_f("trigger_ttt", trig.valid, trig.ttt, 0, "ms");
             kv_f("rlm_oos", s.rlm_oos.n > 0, mean(&s.rlm_oos), 0, "%");
             kv_f("t310", s.rlm_oos.n > 0, s.t310, 0, "");
             kv_end();
         } else {
-            char gs[96], ns[48], c1[16], c2[16], c3[16], c4[16], c5[16];
+            char gs[96], ns[48], ts[40], c1[16], c2[16], c3[16], c4[16], c5[16];
             snprintf(gs, sizeof(gs), "%s %11.2f %s %s %s %s", pct(c1, s.ul_nack, nph), s.grant_rx * 8 / el / 1e6,
                      pct(c2, s.grant_used, s.grant_rx), avg(c3, &s.ul_txpwr, 5),
                      s.pathloss.n ? (sprintf(c4, "%4.0f", mean(&s.pathloss)), c4) : "   -", avg(c5, &s.pc_corr, 5));
             if (hm) snprintf(ns, sizeof(ns), "%5d %6.1f %6.1f", s.nb[bn].pci, mean(&s.nb[bn].rsrp), margin);
             else snprintf(ns, sizeof(ns), "    -      -      -");
-            printf("%s | %5ld  %s %5ld %s %4ld  %s %s %s %5.1f | %5zu %5ld %s %6.2f %s %5s %s %s %s | %s | %s | %s/%s %s | %s | %s | %s\n",
+            if (trig.valid) snprintf(ts, sizeof(ts), "%-17.17s %+5.1f", trig.name, trig.gap);
+            else snprintf(ts, sizeof(ts), "%-17s %5s", "-", "-");
+            printf("%s | %5ld  %s %5ld %s %4ld  %s %s %s %5.1f | %5zu %5ld %s %6.2f %s %5s %s %s %s | %s | %s | %s/%s %s | %s | %s | %s | %s\n",
                    tm, s.dl_tb, pct(b1, s.dl_first_fail, s.dl_first), s.dl_retx, pct(b13, s.dl_retx, s.dl_tb), s.dl_resid,
                    avg(b2, &s.mcs, 4), avg(b3, &s.rbs, 5), pct(b4, s.ntb[2], s.ntb[1] + s.ntb[2]), dlm,
                    s.ul_n, ulr, pct(b5, ulr, s.ul_n), ulm, avg(b6, &s.ul_rb, 5), s.ul_n ? MODS[m] : "-",
@@ -514,7 +528,7 @@ int main(int argc, char **argv)
                    avg(b8, &s.ul_pwr, 4), pct(b9, s.ul_pwrlim, s.ul_n), gs, qs,
                    avg(b10, &s.cqi, 4), avg(b11, &s.cqi1, 4),
                    s.ri[1] + s.ri[2] ? (sprintf(b12, "%4.1f", (s.ri[1] + 2.0 * s.ri[2]) / (s.ri[1] + s.ri[2])), b12) : "   -",
-                   tv, rf, ns);
+                   tv, rf, ns, ts);
         }
         fflush(stdout);
 

@@ -823,6 +823,238 @@ static long stats_ul_retx(const stats_t *s)
     return r;
 }
 
+/* ---- trigger: the network's measurement rule (A1-A5 from meas_config) closest to firing, evaluated the way the modem
+ * does: on the L3-filtered serving RSRP of 0xB179 (else the better antenna of 0xB193, smoothed) and the latest
+ * neighbour measurements (0xB179 intra-frequency, 0xB195 incl. inter-frequency; a cell on another band is only
+ * measured while the network has gaps on, so it is usually unknown until the search runs). Rules with the same
+ * condition on several frequencies count as one (A5@1875/3500/6400). offsetFreq / cell offsets are not decoded (0).
+ * gap: dB the signal can still move before the entering condition holds (<= 0: holds; A5 without a measured
+ * neighbour: the serving part only, 0 once it holds). held: ms the whole condition has held, against the rule's time
+ * to trigger. */
+#define TRIG_MAX 32
+#define TRIG_NB 32
+typedef struct {
+    char rep[112], name[48];   /* "A5[serving<rsrp-115dBm&nb>rsrp-113dBm,hys1dB,ttt480ms]", "A5@1875/3500/6400" */
+    int ev, q1, q2, ttt;       /* 1..5 = A1..A5; threshold quantity 0 RSRP / 1 RSRQ; time to trigger, ms */
+    double t1, t2, off, hys;   /* thresholds, A3 offset, hysteresis */
+    unsigned earfcn[8];        /* A3-A5 frequencies, 0 = the serving one ("@?") */
+    int nf;
+    double since;              /* modem time the whole condition started to hold, < 0 = not holding */
+} trig_rule_t;
+
+typedef struct {
+    char rules[700];           /* rules text the parsed list is from */
+    int nr;
+    trig_rule_t r[TRIG_MAX];
+    int have_srv, have_raw, srv_pci, raw_pci;
+    unsigned srv_earfcn, raw_earfcn;
+    double srv_t, srv_rsrp, raw_t, raw_rsrp, raw_rsrq, last_t;
+    int fed;                   /* a measurement arrived in this output interval */
+    int nnb;
+    struct { unsigned earfcn; int pci; double t, rsrp, rsrq; } nb[TRIG_NB];
+    /* last evaluation */
+    int valid, known, have_nb, nb_q, ttt;
+    char name[48];
+    double gap, nb_val, held;
+} trig_t;
+
+/* next "rsrp<v>" / "rsrq<v>" threshold in s -> quantity, value; NULL if none */
+static const char *trig_thr(const char *s, int *q, double *v)
+{
+    const char *p = strstr(s, "rsr");
+    char *e;
+    if (!p || (p[3] != 'p' && p[3] != 'q')) return NULL;
+    *q = p[3] == 'q';
+    *v = strtod(p + 4, &e);
+    return e;
+}
+
+static void trig_add(trig_t *t, const char *rep, int rl, const char *obj, int ol)
+{
+    char rs[112], os[24];
+    trig_rule_t *r = NULL;
+    if (rl < 4 || rep[0] != 'A' || rep[1] < '1' || rep[1] > '5' || rep[2] != '[') return;
+    snprintf(rs, sizeof(rs), "%.*s", rl, rep);
+    snprintf(os, sizeof(os), "%.*s", ol, obj);
+    for (int i = 0; i < t->nr; i++)
+        if (!strcmp(t->r[i].rep, rs)) r = &t->r[i];
+    if (!r) {
+        if (t->nr == TRIG_MAX) return;
+        r = &t->r[t->nr];
+        memset(r, 0, sizeof(*r));
+        snprintf(r->rep, sizeof(r->rep), "%s", rs);
+        r->ev = rs[1] - '0';
+        r->since = -1;
+        const char *x = rs + 3, *h = strstr(rs, ",hys"), *tt = strstr(rs, ",ttt");
+        if (r->ev == 3) {
+            const char *sv = strstr(rs, "serving");
+            if (!sv) return;
+            r->off = strtod(sv + 7, NULL);
+        } else if (!(x = trig_thr(x, &r->q1, &r->t1)) || (r->ev == 5 && !trig_thr(x, &r->q2, &r->t2)))
+            return;
+        if (!h || !tt) return;
+        r->hys = strtod(h + 4, NULL);
+        r->ttt = atoi(tt + 4);
+        snprintf(r->name, sizeof(r->name), "A%d", r->ev);
+        t->nr++;
+    }
+    if (r->ev >= 3 && r->nf < 8 && (os[0] == '?' || (os[0] >= '0' && os[0] <= '9'))) {
+        size_t l = strlen(r->name);
+        r->earfcn[r->nf++] = os[0] == '?' ? 0 : (unsigned)strtoul(os, NULL, 10);
+        snprintf(r->name + l, sizeof(r->name) - l, "%s%s", r->nf == 1 ? "@" : "/", os);
+    }
+}
+
+/* rules text as in the meas_config event: "measId:report@object,..." (a report holds commas inside [...]) */
+static void trig_parse(trig_t *t, const char *rules)
+{
+    const char *p = rules;
+    snprintf(t->rules, sizeof(t->rules), "%s", rules);
+    t->nr = 0;
+    while (*p) {
+        const char *c = strchr(p, ':'), *at;
+        int depth = 0;
+        if (!c) break;
+        for (at = c + 1; *at && (depth || *at != '@'); at++)
+            depth += *at == '[' ? 1 : *at == ']' ? -1 : 0;
+        if (!*at) break;
+        const char *obj = at + 1, *end = obj + strcspn(obj, ",");
+        trig_add(t, c + 1, (int)(at - c - 1), obj, (int)(end - obj));
+        p = *end ? end + 1 : end;
+    }
+}
+
+static void trig_nb_set(trig_t *t, double mts, unsigned earfcn, int pci, double rsrp, double rsrq)
+{
+    int j;
+    for (j = 0; j < t->nnb && !(t->nb[j].earfcn == earfcn && t->nb[j].pci == pci); j++) ;
+    if (j == t->nnb) {
+        if (t->nnb == TRIG_NB) {  /* full: replace the oldest */
+            j = 0;
+            for (int k = 1; k < t->nnb; k++)
+                if (t->nb[k].t < t->nb[j].t) j = k;
+        } else
+            t->nnb++;
+        t->nb[j].earfcn = earfcn;
+        t->nb[j].pci = pci;
+    }
+    t->nb[j].t = mts;
+    t->nb[j].rsrp = rsrp;
+    t->nb[j].rsrq = rsrq;
+}
+
+/* latest measurements (offsets as in stats_ncell / stats_conn_nb / stats_meas); 1 if the packet was one of them */
+__attribute__((unused)) static int trig_feed(trig_t *t, int code, double mts, const uint8_t *b, int len)
+{
+    if (code == LOG_NCELL) {
+        if (len < 28 || b[0] != 4) return 0;
+        t->have_srv = 1;
+        t->srv_t = mts;
+        t->srv_earfcn = rd32(b + 8);
+        t->srv_pci = rd16(b + 12) & 0x1ff;
+        t->srv_rsrp = (int16_t)rd16(b + 16) / 16.0 - 180;
+        for (int i = 0; i < b[24] && 28 + 12 * (i + 1) <= len; i++) {
+            const uint8_t *r = b + 28 + 12 * i;
+            int pci = rd16(r) & 0x1ff;
+            if (pci != t->srv_pci)
+                trig_nb_set(t, mts, t->srv_earfcn, pci, (int16_t)rd16(r + 2) / 16.0 - 180, (rd16(r + 6) & 0xfff) / 16.0 - 30);
+        }
+    } else if (code == LOG_CONN_NB) {
+        int ver, pl;
+        const uint8_t *p;
+        if (len < 4 || b[0] != 1) return 0;
+        subpkt_it it = { b, len, 0, 4 };
+        while (subpkt_next(&it, &ver, &p, &pl)) {
+            if (p[-4] != 31 || (ver != 3 && ver != 4) || pl < 8) continue;
+            unsigned earfcn = ver == 4 ? rd32(p) : rd16(p);
+            int nc = rd16(p + (ver == 4 ? 4 : 2)) & 63, q = ver == 4 ? 8 : 4;
+            for (int i = 0; i < nc && q + 52 * (i + 1) <= pl; i++) {
+                const uint8_t *c = p + q + 52 * i;
+                int pci = rd32(c) & 1023;
+                if (!(t->have_srv && earfcn == t->srv_earfcn && pci == t->srv_pci))
+                    trig_nb_set(t, mts, earfcn, pci, (rd16(c + 12) & 4095) / 16.0 - 180, (rd32(c + 20) >> 10 & 1023) / 16.0 - 30);
+            }
+        }
+    } else if (code == LOG_MEAS) {
+        if (len < 8 + 84 || b[4] != 0x19) return 0;
+        double r0 = (rd32(b + 32) & 0xfff) / 16.0 - 180, r1 = (rd32(b + 36) & 0xfff) / 16.0 - 180;
+        double rp = r0 > r1 ? r0 : r1, rq = (rd32(b + 44) >> 20 & 0x3ff) / 16.0 - 30;
+        unsigned e = rd32(b + 8);
+        int pci = rd32(b + 12) & 0x1ff, fresh = t->have_raw && mts - t->raw_t < 1 && e == t->raw_earfcn && pci == t->raw_pci;
+        /* single samples are noisy: smooth over ~20 (about the modem's L3 filter at 50 samples/s) */
+        t->raw_rsrp = fresh ? t->raw_rsrp + (rp - t->raw_rsrp) / 20 : rp;
+        t->raw_rsrq = fresh ? t->raw_rsrq + (rq - t->raw_rsrq) / 20 : rq;
+        t->have_raw = 1;
+        t->raw_t = mts;
+        t->raw_earfcn = e;
+        t->raw_pci = pci;
+    } else
+        return 0;
+    t->last_t = mts;
+    t->fed = 1;
+    return 1;
+}
+
+/* evaluate at modem time mts against the current rules text (the mobility's, NULL = not connected) */
+__attribute__((unused)) static void trig_eval(trig_t *t, const char *rules, double mts)
+{
+    t->valid = 0;
+    if (!rules) rules = "none";
+    if (strcmp(rules, t->rules)) trig_parse(t, rules);  /* new rules: their time to trigger starts again */
+    int fs = t->have_srv && mts - t->srv_t < 1, fr = t->have_raw && mts - t->raw_t < 1;
+    double ms[2] = { fs ? t->srv_rsrp : t->raw_rsrp, t->raw_rsrq };
+    unsigned se = fs ? t->srv_earfcn : t->raw_earfcn;
+    int sp = fs ? t->srv_pci : t->raw_pci;
+    for (int i = 0; i < t->nr; i++) {
+        trig_rule_t *r = &t->r[i];
+        int qn = r->ev == 5 ? r->q2 : r->q1, hn = 0, known = 1;  /* qn: neighbour quantity (A3: RSRP) */
+        double mn = 0, g;
+        if ((!fs && !fr) || (r->ev != 3 && r->ev != 4 && r->q1 && !fr)) { r->since = -1; continue; }
+        if (r->ev >= 3)  /* strongest fresh neighbour on the rule's frequencies */
+            for (int j = 0; j < t->nnb; j++) {
+                double v = qn ? t->nb[j].rsrq : t->nb[j].rsrp;
+                int on = 0;
+                if (mts - t->nb[j].t > 2 || (t->nb[j].earfcn == se && t->nb[j].pci == sp) || (qn && v < -29.99)) continue;
+                for (int k = 0; k < r->nf; k++)
+                    on |= (r->earfcn[k] ? r->earfcn[k] : se) == t->nb[j].earfcn;
+                if (on && (!hn || v > mn)) { mn = v; hn = 1; }
+            }
+        if (r->ev == 1) g = r->t1 + r->hys - ms[r->q1];
+        else if (r->ev == 2) g = ms[r->q1] - (r->t1 - r->hys);
+        else if (r->ev == 3 && hn) g = ms[0] + r->off + r->hys - mn;
+        else if (r->ev == 4 && hn) g = r->t1 + r->hys - mn;
+        else if (r->ev == 5) {
+            g = ms[r->q1] - (r->t1 - r->hys);
+            if (hn && r->t2 + r->hys - mn > g) g = r->t2 + r->hys - mn;
+            else if (!hn && g < 0) g = 0;  /* serving side holds, the neighbour is not measured yet */
+            known = hn;
+        } else { r->since = -1; continue; }  /* A3 / A4 without a measured neighbour */
+        int holds = known && g <= 0;
+        if (!holds) r->since = -1;
+        else if (r->since < 0) r->since = mts;
+        /* closest to firing; on a tie the rule whose neighbour is measured */
+        if (!t->valid || g < t->gap - 0.05 || (g < t->gap + 0.05 && known && !t->known)) {
+            t->valid = 1;
+            t->known = known;
+            t->gap = g;
+            t->have_nb = hn;
+            t->nb_val = mn;
+            t->nb_q = qn;
+            t->ttt = r->ttt;
+            t->held = holds ? (mts - r->since) * 1000 : 0;
+            snprintf(t->name, sizeof(t->name), "%s", r->name);
+        }
+    }
+}
+
+/* end of an output interval: evaluate once more (the rules may have changed since); nothing measured in it: NA */
+__attribute__((unused)) static void trig_interval(trig_t *t, const char *rules)
+{
+    trig_eval(t, rules, t->last_t);
+    if (!t->fed) t->valid = 0;
+    t->fed = 0;
+}
+
 static int stats_dispatch(stats_t *s, int code, const uint8_t *b, int len)
 {
     switch (code) {
