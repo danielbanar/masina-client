@@ -6,14 +6,20 @@
  * (/api/v1/set?video0.bitrate=<kbit/s>). It decides on every stats line, so it reacts as fast as modem_link's interval
  * (0.25 s in S92modemlink).
  *
+ * Congestion is a standing queue: qdelay_min / ul_buf_min, the smallest queue of the interval. A queue that never
+ * empties means the link carries less than is sent. Video keyframes only make short spikes that drain within the
+ * interval, so they leave it near 0 (with the interval average they read as congestion and cut the bitrate for
+ * nothing: 16 % of the 0.25 s lines at 7 Mbit/s with 12x keyframes, against 0 for the standing queue). Lines without
+ * qdelay_min (older modem_link) use the interval average as before.
+ *
  * How hard it reacts, and the highest bitrate it uses, come from a preset (table below):
  *   congested -> aim for a share of what the uplink carried, minus enough to empty the queue within `drain`
  *                seconds; while the bitrate is above that, cut to it (at least to down_factor of the bitrate, at most
  *                to cut_floor of it in one line). Once below it, hold: the queue is draining. Going by the rate rather
  *                than by whether the queue shrinks also works when only bsr is there, which tops out at 150 KB.
  *   clear     -> once clear for a while, go straight back to ul_share of what the uplink carried while congested
- *                (if that was in the last 10 s), then raise a small step per line (at least 25 kbit/s), up to the
- *                preset's max. After 10 s without congestion the link may carry more: at least 1 % of the max per
+ *                (if that was in the last 10 s), then raise a small step per line (at least 25 kbit/s; a quarter
+ *                step while still within those 10 s, it is where the link congested), up to the preset's max. After 10 s without congestion the link may carry more: at least 1 % of the max per
  *                line. Nothing queued counts as clear.
  *   otherwise -> hold.
  * Below 1 Mbit/s the frame rate goes down as well (/api/v1/set?video0.fps=): 40, 30, then 20 fps, so each frame keeps
@@ -74,15 +80,17 @@ typedef struct {
                                         * (the floor because one stalled interval reads as ~0 uplink) */
     double qdelay_clear, qbytes_clear; /* clear: qdelay < qdelay_clear ms, or < qbytes_clear KB queued */
     double up_after, up_step;          /* raise after up_after s clear, by up_step of the bitrate per line */
+    double qmin_high, qmin_clear;      /* standing queue (qdelay_min, ms): congested at >= qmin_high with
+                                        * >= qbytes_min KB still queued (or >= qbytes_high KB), clear below qmin_clear */
 } preset_t;
 
 /* the small qbytes_min keeps a near-idle link from looking congested: modem_link floors the rate at 0.5 Mbit/s,
  * so a 3 KB burst alone already reads as 50 ms */
 static const preset_t PRESETS[] = {
-    /*               max     congested       aim          cut           clear     raise */
-    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075 }, /* ~3 %/s */
-    { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125 }, /* ~5 %/s */
-    { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02 },   /* ~8 %/s */
+    /*               max     congested       aim          cut           clear     raise            standing */
+    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075,     10, 3 },  /* ~3 %/s */
+    { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125,     20, 5 },  /* ~5 %/s */
+    { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10 }, /* ~8 %/s */
 };
 
 /* below `below` kbit/s use `fps`; back up only at 20 % above the step, so the frame rate does not flap */
@@ -227,8 +235,9 @@ static int camera_set(const conf_t *c, const char *key, long value)
 
 /* ---- modem_link stats */
 typedef struct {
-    int has_qdelay, has_queue, has_ul;
+    int has_qdelay, has_queue, has_ul, has_standing;
     double qdelay, queue, ul_rate; /* ms, KB, Mbit/s */
+    double qdelay_min, queue_min;  /* standing queue: smallest of the interval, ms and KB */
 } link_t;
 
 /* number after ";key=" in a modem_link line; 0 if missing or NA */
@@ -253,6 +262,9 @@ static int link_parse(const char *line, link_t *l)
     l->has_qdelay = kv_num(line, "qdelay", &l->qdelay);
     l->has_queue = kv_num(line, "ul_buf", &l->queue) || kv_num(line, "bsr", &l->queue); /* exact buffer if logged */
     l->has_ul = kv_num(line, "ul_rate", &l->ul_rate);
+    l->has_standing = kv_num(line, "qdelay_min", &l->qdelay_min);
+    if (l->has_standing && !kv_num(line, "ul_buf_min", &l->queue_min)) /* only bsr on this modem: back from the delay */
+        l->queue_min = l->qdelay_min / 1000 * (l->has_ul && l->ul_rate > 0.5 ? l->ul_rate : 0.5) * 1000 / 8; /* KB */
     return 1;
 }
 
@@ -312,6 +324,8 @@ static void report(const alink_t *a, const char *reason, long prev, const link_t
         n += num_or_na(line + n, sizeof(line) - n, "qdelay", l->has_qdelay, l->qdelay, 0, "ms");
         n += num_or_na(line + n, sizeof(line) - n, "queue", l->has_queue, l->queue, 1, "KB");
         n += num_or_na(line + n, sizeof(line) - n, "ul_rate", l->has_ul, l->ul_rate, 2, "Mbps");
+        n += num_or_na(line + n, sizeof(line) - n, "qdelay_min", l->has_standing, l->qdelay_min, 0, "ms");
+        n += num_or_na(line + n, sizeof(line) - n, "queue_min", l->has_standing, l->queue_min, 1, "KB");
     }
     puts(line);
     fflush(stdout);
@@ -441,9 +455,19 @@ static void release(alink_t *a, const conf_t *c, const char *reason)
 static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
 {
     const preset_t *p = a->p;
-    int congested = l->has_queue && ((l->has_qdelay && l->qdelay >= p->qdelay_high && l->queue >= p->qbytes_min) ||
+    int congested, clear;
+    double drain_kb; /* what has to be drained: the standing queue (a keyframe spike drains by itself) */
+    if (l->has_standing) {
+        congested = (l->qdelay_min >= p->qmin_high && l->queue_min >= p->qbytes_min) ||
+                    (p->qbytes_high > 0 && l->queue_min >= p->qbytes_high);
+        clear = l->qdelay_min < p->qmin_clear || l->queue_min < p->qbytes_clear;
+        drain_kb = l->queue_min;
+    } else { /* older modem_link: interval average */
+        congested = l->has_queue && ((l->has_qdelay && l->qdelay >= p->qdelay_high && l->queue >= p->qbytes_min) ||
                                      (p->qbytes_high > 0 && l->queue >= p->qbytes_high));
-    int clear = !l->has_queue || l->queue < p->qbytes_clear || (l->has_qdelay && l->qdelay < p->qdelay_clear);
+        clear = !l->has_queue || l->queue < p->qbytes_clear || (l->has_qdelay && l->qdelay < p->qdelay_clear);
+        drain_kb = l->queue;
+    }
     if (a->current > p->max_bitrate) {
         apply(a, c, p->max_bitrate, "max", l); /* someone else set more than the preset allows */
     } else if (congested) {
@@ -453,12 +477,12 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
         if (l->has_ul) {
             a->cap = l->ul_rate * 1000; /* with a queue waiting, the modem sends all the link gives it */
             a->cap_time = t;
-            double aim = a->cap * p->ul_share - l->queue * 8 / p->drain; /* kbit/s */
+            double aim = a->cap * p->ul_share - drain_kb * 8 / p->drain; /* kbit/s */
             cut = a->current > aim;
             if (aim < target)
                 target = aim;
         } else
-            cut = !a->was_congested || l->queue >= a->last_queue; /* no rate: cut again only while the queue grows */
+            cut = !a->was_congested || drain_kb >= a->last_queue; /* no rate: cut again only while the queue grows */
         if (target < a->current * p->cut_floor)
             target = a->current * p->cut_floor;
         if (cut && t - a->last_change >= MIN_GAP && apply(a, c, (long)target, "congestion", l))
@@ -470,6 +494,10 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
             long step = (long)(a->current * p->up_step);
             if (t - a->cap_time >= CAP_VALID && step < p->max_bitrate * PROBE_STEP)
                 step = (long)(p->max_bitrate * PROBE_STEP);
+            /* back at what the link carried within the last CAP_VALID s: that is where it congested, approach it
+             * gently (a clear standing queue is common between congestions, full-speed steps just hit it again) */
+            if (t - a->cap_time < CAP_VALID && a->current >= a->cap * p->ul_share)
+                step /= 4;
             if (step < UP_MIN_STEP) step = UP_MIN_STEP;
             long target = a->current + step;
             if (t - a->cap_time < CAP_VALID && a->cap * p->ul_share > target)
@@ -480,7 +508,7 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
     } else
         a->clear_since = -1;
     a->was_congested = congested;
-    a->last_queue = l->has_queue ? l->queue : 0;
+    a->last_queue = l->has_standing ? l->queue_min : l->has_queue ? l->queue : 0;
     fps_update(a, c); /* also follows a bitrate someone else set */
 }
 

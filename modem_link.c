@@ -16,7 +16,8 @@
  *       by the eNB and share used, PHICH NACKs (direct UL HARQ failures), actual tx power, DL path loss, closed-loop
  *       power correction f(i), mean PDCCH aggregation level (1 good .. 8 = eNB protecting control in poor radio)
  *   UL buffer (0xB066 MAC UL buffer status v5): exact bytes queued in the modem every subframe (BSR tops out at
- *       150 KB); queue delay uses it when logged
+ *       150 KB); queue delay uses it when logged.
+ *       ul_buf_min / qdelay_min: smallest queue of the interval = standing queue (keyframe spikes do not raise it)
  *   RLC / PDCP (0xB087, 0xB097, 0xB0B4 statistics): retransmissions, NACKs, dropped PDUs, t-Reordering expiries,
  *       PDCP discards, increase over the interval (NA = no statistics packet in the interval, they come every ~1.3 s)
  *   Neighbours (0xB179 v4 intra-frequency, 0xB195 every measured frequency): count, strongest EARFCN/PCI/RSRP/RSRQ,
@@ -286,7 +287,7 @@ static char *avg(char *o, const acc_t *a, int w)
 static void print_events(mobility_t *m, const char *model, int table, double toff)
 {
     for (int i = 0; i < m->nev; i++) {
-        double wt = now();  /* host receive time; modem clock only for durations (see lte_link.py) */
+        double wt = wall_time();  /* host receive time; modem clock only for durations (see lte_link.py) */
         (void)toff;
         time_t w = (time_t)wt;
         char ts[32];
@@ -465,9 +466,12 @@ int main(int argc, char **argv)
             kv_f("pathloss", s.pathloss.n > 0, mean(&s.pathloss), 1, "dB");
             kv_f("ul_buf", s.ul_buf.n > 0, mean(&s.ul_buf) / 1000, 1, "KB");
             kv_f("ul_buf_max", s.ul_buf.n > 0, s.ul_buf.max / 1000, 1, "KB");
+            kv_f("ul_buf_min", s.ul_buf.n > 0, s.ul_buf.min / 1000, 1, "KB");
             kv_f("bsr", s.bsr.n > 0, mean(&s.bsr) / 1000, 1, "KB");
             kv_f("qdelay", hq, qd, 0, "ms");
             kv_f("qdelay_max", hq, qm, 0, "ms");
+            double qmin = stats_qdelay_min(&s, el);
+            kv_f("qdelay_min", qmin >= 0, qmin, 0, "ms");
             kv_l("qwarn", stats_queue_warn(&s, el));
             kv_f("phr", s.phr.n > 0, mean(&s.phr), 0, "dB");
             for (int k = 0; k < L2_N; k++)

@@ -17,10 +17,18 @@
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ misc */
-static double now(void)
+static double now(void) /* monotonic: durations and deadlines only, not a time of day */
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* time of day for printed timestamps */
+__attribute__((unused)) static double wall_time(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
@@ -783,6 +791,17 @@ static int stats_qdelay(const stats_t *s, double el, double *mean_ms, double *ma
     *mean_ms = mean(q) / rate * 1000;
     *max_ms = q->max / rate * 1000;
     return 1;
+}
+
+/* standing uplink queue: the smallest queue of the interval in ms at the interval's uplink rate. A queue that never
+ * empties means the link carries less than is sent; short spikes (video keyframes) leave it near 0. -1 if none. */
+__attribute__((unused)) static double stats_qdelay_min(const stats_t *s, double el)
+{
+    const acc_t *q = stats_queue(s);
+    if (!q->n) return -1;
+    double rate = s->ul_bytes / el;
+    if (rate < 0.5e6 / 8) rate = 0.5e6 / 8;
+    return q->min / rate * 1000;
 }
 
 __attribute__((unused)) static int stats_queue_warn(const stats_t *s, double el)
