@@ -375,8 +375,10 @@ int main(int argc, char **argv)
     char b1[32], b2[32], b3[32], b4[32], b5[32], b6[32], b7[32], b8[32], b9[32], b10[32], b11[32], b12[32];
 
     long n_int = 0;
+    /* each interval starts where the previous one ended, so the time spent on the AT polls and printing counts too
+       (the DIAG data that arrived meanwhile is read in the next interval) */
+    double t0 = now(), end = t0 + interval;
     for (long n = 0; !stop; n++, n_int++) {
-        double t0 = now(), end = t0 + interval;
         int code, len;
         const uint8_t *body;
         while (!stop && (len = diag_log(&d, end, &code, &body)) != -2) {
@@ -390,8 +392,12 @@ int main(int argc, char **argv)
             else if (code == LOG_RACH_ATT) mob_rach_att(&mob, mts, body, len);
             if (mob.nev) print_events(&mob, hl.model, table, toff);
         }
-        double el = now() - t0;
+        double t1 = now(), el = t1 - t0;
+        time_t wall = time(NULL);  /* the line's time = end of the interval (the AT poll below can take 0.2 s) */
         if (el <= 0) el = 1e-3;
+        t0 = t1;
+        end += interval;
+        if (end < t1) end = t1 + interval;  /* fell behind (slow AT port): start afresh */
         health_poll(&hl);
         char tv[32];
         snprintf(tv, sizeof(tv), hl.have_t ? "%3d " : "  - ", hl.temp);
@@ -399,7 +405,6 @@ int main(int argc, char **argv)
         if (hl.have_t) { if (!seen_t || hl.tmin < tmin) tmin = hl.tmin; if (!seen_t || hl.tmax > tmax) tmax = hl.tmax; seen_t = 1; }
         if (hl.have_v) { if (!seen_v || hl.vmin < vmin) vmin = hl.vmin; if (!seen_v || hl.vmax > vmax) vmax = hl.vmax; seen_v = 1; }
         char tm[16];
-        time_t wall = time(NULL);
         strftime(tm, sizeof(tm), "%H:%M:%S", localtime(&wall));
         if (table && n % 20 == 0) puts(HEADER);
         if (s.rf_valid && have_cell && ((int)s.earfcn != cell_e || s.pci != cell_p)) {

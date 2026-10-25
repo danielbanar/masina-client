@@ -619,9 +619,14 @@ static void stats_ul_buf(stats_t *s, const uint8_t *b, int len)
             int nl = p[q + 2];
             double tot = 0;
             q += 3;
-            for (int j = 0; j < nl && q + 16 <= pl; j++, q += 16)  /* lcid, prio, new (2 fields), retx, ctrl bytes */
-                tot += (double)rd32(p + q + 2) + rd32(p + q + 6) + rd32(p + q + 10) + rd16(p + q + 14);
-            acc(&s->ul_buf, tot);
+            int bad = 0;
+            for (int j = 0; j < nl && q + 16 <= pl; j++, q += 16) {  /* lcid, prio, new (2 fields), retx, ctrl bytes */
+                int32_t n1 = (int32_t)rd32(p + q + 2), n2 = (int32_t)rd32(p + q + 6), rt = (int32_t)rd32(p + q + 10);
+                bad |= n1 < 0 || n2 < 0 || rt < 0;
+                tot += (double)n1 + n2 + rt + rd16(p + q + 14);
+            }
+            /* a counter that briefly went negative (seen once during a band search) read as ~4 GB: drop the sample */
+            if (!bad) acc(&s->ul_buf, tot);
         }
     }
 }
