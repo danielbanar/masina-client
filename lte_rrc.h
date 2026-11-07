@@ -487,7 +487,7 @@ static const char *rrc_ota_msg(const uint8_t *b, int len, int *pci, unsigned *ea
 }
 
 /* ---- mobility events: same logic and text as Mobility in lte_link.py */
-enum { MOB_SETUP, MOB_RELEASE, MOB_REPORT, MOB_HO, MOB_HO_DONE, MOB_REEST, MOB_NCOUNT };
+enum { MOB_SETUP, MOB_RELEASE, MOB_REPORT, MOB_HO, MOB_HO_DONE, MOB_REEST, MOB_NAS_REJ, MOB_NCOUNT };
 #define MOB_MAXEV 16
 typedef struct {
     meas_state_t meas;
@@ -672,6 +672,118 @@ static void mob_rach_att(mobility_t *m, double mts, const uint8_t *b, int len)
         m->reason = NULL;
         return;
     }
+}
+
+/* ---- NAS: registration (EMM) and data bearer (ESM) messages between the modem and the core network (3GPP TS 24.301),
+ * from the 0xB0EC / 0xB0ED (EMM in / out) and 0xB0E2 / 0xB0E3 (ESM in / out) logs: 4 header bytes (log version, release,
+ * major, minor version), then the NAS message, already deciphered ("plain"). */
+typedef struct { uint8_t t; const char *n; } nas_name_t;
+static const nas_name_t NAS_EMM[] = {
+    { 0x41, "attach_request" }, { 0x42, "attach_accept" }, { 0x43, "attach_complete" }, { 0x44, "attach_reject" },
+    { 0x45, "detach_request" }, { 0x46, "detach_accept" }, { 0x48, "tau_request" }, { 0x49, "tau_accept" },
+    { 0x4a, "tau_complete" }, { 0x4b, "tau_reject" }, { 0x4c, "extended_service_request" },
+    { 0x4d, "control_plane_service_request" }, { 0x4e, "service_reject" }, { 0x4f, "service_accept" },
+    { 0x50, "guti_reallocation_command" }, { 0x51, "guti_reallocation_complete" }, { 0x52, "authentication_request" },
+    { 0x53, "authentication_response" }, { 0x54, "authentication_reject" }, { 0x55, "identity_request" },
+    { 0x56, "identity_response" }, { 0x5c, "authentication_failure" }, { 0x5d, "security_mode_command" },
+    { 0x5e, "security_mode_complete" }, { 0x5f, "security_mode_reject" }, { 0x60, "emm_status" },
+    { 0x61, "emm_information" }, { 0x62, "downlink_nas_transport" }, { 0x63, "uplink_nas_transport" },
+    { 0x64, "cs_service_notification" }, { 0x68, "downlink_generic_nas_transport" },
+    { 0x69, "uplink_generic_nas_transport" }, { 0, NULL } };
+static const nas_name_t NAS_ESM[] = {
+    { 0xc1, "activate_default_bearer_request" }, { 0xc2, "activate_default_bearer_accept" },
+    { 0xc3, "activate_default_bearer_reject" }, { 0xc5, "activate_dedicated_bearer_request" },
+    { 0xc6, "activate_dedicated_bearer_accept" }, { 0xc7, "activate_dedicated_bearer_reject" },
+    { 0xc9, "modify_bearer_request" }, { 0xca, "modify_bearer_accept" }, { 0xcb, "modify_bearer_reject" },
+    { 0xcd, "deactivate_bearer_request" }, { 0xce, "deactivate_bearer_accept" }, { 0xd0, "pdn_connectivity_request" },
+    { 0xd1, "pdn_connectivity_reject" }, { 0xd2, "pdn_disconnect_request" }, { 0xd3, "pdn_disconnect_reject" },
+    { 0xd4, "bearer_resource_allocation_request" }, { 0xd5, "bearer_resource_allocation_reject" },
+    { 0xd6, "bearer_resource_modification_request" }, { 0xd7, "bearer_resource_modification_reject" },
+    { 0xd9, "esm_information_request" }, { 0xda, "esm_information_response" }, { 0xdb, "notification" },
+    { 0xe8, "esm_status" }, { 0, NULL } };
+/* EMM causes (TS 24.301 9.9.3.9) and ESM causes (9.9.4.4) that come up in practice; others print as the number */
+static const nas_name_t EMM_CAUSE[] = {
+    { 2, "imsi_unknown_in_hss" }, { 3, "illegal_ue" }, { 5, "imei_not_accepted" }, { 6, "illegal_me" },
+    { 7, "eps_services_not_allowed" }, { 8, "eps_and_non_eps_services_not_allowed" },
+    { 9, "ue_identity_cannot_be_derived" }, { 10, "implicitly_detached" }, { 11, "plmn_not_allowed" },
+    { 12, "tracking_area_not_allowed" }, { 13, "roaming_not_allowed_in_this_ta" },
+    { 14, "eps_services_not_allowed_in_this_plmn" }, { 15, "no_suitable_cells_in_ta" },
+    { 16, "msc_temporarily_not_reachable" }, { 17, "network_failure" }, { 18, "cs_domain_not_available" },
+    { 19, "esm_failure" }, { 20, "mac_failure" }, { 21, "synch_failure" }, { 22, "congestion" },
+    { 35, "requested_service_option_not_authorized" }, { 39, "cs_service_temporarily_not_available" },
+    { 40, "no_eps_bearer_context_activated" }, { 42, "severe_network_failure" }, { 111, "protocol_error" }, { 0, NULL } };
+static const nas_name_t ESM_CAUSE[] = {
+    { 8, "operator_determined_barring" }, { 26, "insufficient_resources" }, { 27, "missing_or_unknown_apn" },
+    { 28, "unknown_pdn_type" }, { 29, "user_authentication_failed" }, { 30, "rejected_by_gateway" },
+    { 31, "request_rejected_unspecified" }, { 32, "service_option_not_supported" },
+    { 33, "service_option_not_subscribed" }, { 34, "service_option_temporarily_out_of_order" },
+    { 36, "regular_deactivation" }, { 38, "network_failure" }, { 39, "reactivation_requested" },
+    { 54, "pdn_connection_does_not_exist" }, { 55, "multiple_pdn_connections_not_allowed" },
+    { 65, "maximum_number_of_eps_bearers_reached" }, { 111, "protocol_error" }, { 0, NULL } };
+
+static const char *nas_name(const nas_name_t *t, int v)
+{
+    for (; t->n; t++)
+        if (t->t == v) return t->n;
+    return NULL;
+}
+
+/* one NAS message -> event=nas;dir=dl|ul;msg=...[;type=...][;cause=<n>:<name>]; dl = from the network */
+static void mob_nas(mobility_t *m, double mts, const uint8_t *b, int len, int dl)
+{
+    if (len < 6) return;
+    const uint8_t *p = b + 4;
+    int n = len - 4, pd = p[0] & 15, sh = p[0] >> 4;
+    if (pd == 7 && sh >= 1 && sh <= 4) {  /* integrity protected: 4 bytes MAC + sequence number, then the plain message */
+        if (n < 8) return;
+        p += 6; n -= 6; pd = p[0] & 15; sh = p[0] >> 4;
+    }
+    const char *name = NULL, *cause = NULL;
+    char unk[32], ex[96] = "", cb[64];
+    int cv = -1, rej = 0;
+    if (pd == 7 && sh == 12) name = "service_request";  /* short format, no message type */
+    else if (pd == 7 && sh == 0 && n >= 2) {
+        int mt = p[1];
+        name = nas_name(NAS_EMM, mt);
+        if ((mt == 0x44 || mt == 0x4b || mt == 0x4e) && n >= 3) { cv = p[2]; rej = 1; }  /* attach / TAU / service reject */
+        else if (mt == 0x45 && n >= 3) {
+            int ty = p[2] & 7;
+            if (dl) {  /* network-initiated detach: type, then optionally an EMM cause (IEI 0x53) */
+                static const char *T[4] = { "NA", "reattach_required", "reattach_not_required", "imsi_detach" };
+                snprintf(ex, sizeof(ex), ";type=%s", ty < 4 ? T[ty] : "NA");
+                if (n >= 5 && p[3] == 0x53) cv = p[4];
+                rej = 1;
+            } else {
+                static const char *T[4] = { "NA", "eps", "imsi", "combined" };
+                snprintf(ex, sizeof(ex), ";type=%s;switch_off=%d", ty < 4 ? T[ty] : "NA", (p[2] >> 3) & 1);
+            }
+        } else if (mt == 0x48 && n >= 3) {
+            static const char *T[4] = { "ta_updating", "combined", "combined_imsi_attach", "periodic" };
+            snprintf(ex, sizeof(ex), ";type=%s", (p[2] & 7) < 4 ? T[p[2] & 7] : "NA");
+        } else if (mt == 0x41 && n >= 3) {
+            int ty = p[2] & 7;
+            snprintf(ex, sizeof(ex), ";type=%s", ty == 1 ? "eps" : ty == 2 ? "combined" : ty == 6 ? "emergency" : "NA");
+        }
+        if (!name) { snprintf(unk, sizeof(unk), "emm_0x%02x", mt); name = unk; }
+        if (cv >= 0) cause = nas_name(EMM_CAUSE, cv);
+    } else if (pd == 2 && n >= 3) {  /* ESM: bearer identity / PTI / message type */
+        int mt = p[2];
+        name = nas_name(NAS_ESM, mt);
+        if ((mt == 0xc3 || mt == 0xc7 || mt == 0xcb || mt == 0xcd || mt == 0xd1 || mt == 0xd3 || mt == 0xd5 || mt == 0xd7 ||
+             mt == 0xe8) && n >= 4) {
+            cv = p[3];
+            cause = nas_name(ESM_CAUSE, cv);
+        }
+        if (!name) { snprintf(unk, sizeof(unk), "esm_0x%02x", mt); name = unk; }
+    } else
+        return;
+    if (cv >= 0) {
+        snprintf(cb, sizeof(cb), ";cause=%d:%s", cv, cause ? cause : "other");
+        size_t l = strlen(ex);
+        snprintf(ex + l, sizeof(ex) - l, "%s", cb);
+    }
+    if (rej) m->counts[MOB_NAS_REJ]++;
+    mob_ev(m, mts, "event=nas;dir=%s;msg=%s%s", dl ? "dl" : "ul", name, ex);
 }
 
 #endif
