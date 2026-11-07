@@ -40,6 +40,11 @@
  * and if it is above the target the frame rate goes down (/api/v1/live/set?video0.fps=) to the step expected to fit
  * (60 40 30 20 15 ..., not below ALINK_MIN_FPS): a detailed scene can need more than the floor at the full frame rate.
  * Recovering, the frame rate goes back up first, a step at a time, and only then the bitrate.
+ * ALINK_BITRATE_OVERSHOOT_CONTROL=true also watches the output all the time: at or above ALINK_BITRATE_OVERSHOOT_MAX
+ * times the target (default 1.5) the bitrate goes down (by the overshoot, at most the preset's cut_floor per step),
+ * and at the floor the frame rate, whether the link is congested or not. Without modem stats the way back is its own:
+ * below OS_BACK of the max for up_after s, frame rate first, then the bitrate in OS_UP steps back to the one that
+ * was set (not above it).
  *
  * Thermal: the SoC temperature (/sys/devices/virtual/mstar/msys/TEMP_R) caps the frame rate by /etc/temp_profile.conf
  * ("<min>-<max> <fps|-> <scale of the full rate|-> <update s>", first matching line), back up THERM_HYST degrees below
@@ -49,7 +54,8 @@
  * carries on from. The bitrate and frame rate the camera had when modem_alink took over, or the last change from
  * someone else, are restored when it is disabled or stops. No stats for 3 s: the bitrate is held.
  *
- * Control on port 2226 (all interfaces), HTTP or UDP: enable=0|1 and preset=performance|balanced|quality, keys
+ * Control on port 2226 (all interfaces), HTTP or UDP: enable=0|1, preset=performance|balanced|quality,
+ * bitrate_overshoot_control=0|1 and bitrate_overshoot_max=<x> (not kept: masina.conf sets them at start), keys
  * optionally prefixed "alink.". Both answer with a status line (ALINK;...;enabled=1;preset=...;bitrate=...).
  *   curl 'http://<drone>:2226/?preset=performance&enable=1'       any path; no query = status only
  *   echo 'preset=quality;enable=1' | nc -u -w1 <drone> 2226
@@ -57,7 +63,8 @@
  * /etc/masina.conf: ALINK_ENABLED=true|false (default true), ALINK_PRESET (default balanced), ALINK_CAMERA=host[:port]
  * (default 127.0.0.1:80), ALINK_MIN_BITRATE=<kbit/s> (default 1), ALINK_CONTROL_PORT (default 2226),
  * ALINK_ENC_MIN=<kbit/s> (default 1000), ALINK_MIN_FPS (default 15), ALINK_IFACE=auto|<ifname> (default auto),
- * ALINK_THERMAL=true|false (default true), ALINK_TEMP_PROFILE=<path> (default /etc/temp_profile.conf), GROUND_IP: every
+ * ALINK_THERMAL=true|false (default true), ALINK_TEMP_PROFILE=<path> (default /etc/temp_profile.conf),
+ * ALINK_BITRATE_OVERSHOOT_CONTROL=true|false (default false), ALINK_BITRATE_OVERSHOOT_MAX=<x> (default 1.5), GROUND_IP: every
  * change is sent there on port 2224 as "ALINK;time=...;enabled=...;preset=...;bitrate=...;...;reason=...".
  *
  * usage: modem_alink [performance|balanced|quality]      SIGINT/SIGTERM gives the camera back and exits
@@ -99,6 +106,8 @@
 #define FD_OVER 1.05      /* at the floor, output above this share of the target means frames have to go */
 #define FD_AIM 0.90       /* drop to the step expected to give this share of the target */
 #define FD_HDR 40         /* bytes per packet that are not video: IPv4 20 + UDP 8 + RTP 12 (+14 on Ethernet) */
+#define OS_BACK 0.8       /* overshoot control: back up once the output is below this share of the max ... */
+#define OS_UP 0.10        /* ... raising the bitrate by this share per step, back to the one that was set */
 #define FD_IFACE_EVERY 30.0 /* s between looking up the stream's route again */
 #define THERM_TEMP "/sys/devices/virtual/mstar/msys/TEMP_R"
 #define THERM_HYST 2      /* degrees below a band before going back up from it */
@@ -174,6 +183,8 @@ typedef struct {
     long min_bitrate; /* kbit/s */
     long enc_min;     /* kbit/s: the encoder's own floor, the bitrate goes no lower */
     int min_fps, thermal;
+    int os_control;   /* ALINK_BITRATE_OVERSHOOT_CONTROL */
+    double os_max;    /* ALINK_BITRATE_OVERSHOOT_MAX */
     char iface[32];   /* "auto": the route to waybeam's outgoing.server */
     char temp_profile[128];
 } conf_t;
@@ -189,6 +200,7 @@ static void conf_read(conf_t *c)
     c->enc_min = 1000;
     c->min_fps = 15;
     c->thermal = 1;
+    c->os_max = 1.5;
     snprintf(c->iface, sizeof(c->iface), "auto");
     snprintf(c->temp_profile, sizeof(c->temp_profile), "/etc/temp_profile.conf");
     FILE *f = fopen(MASINA_CONF, "r");
@@ -208,10 +220,15 @@ static void conf_read(conf_t *c)
             if (sscanf(buf, "ALINK_THERMAL=%15s", on) == 1 && truthy(on) >= 0)
                 c->thermal = truthy(on);
             sscanf(buf, "ALINK_TEMP_PROFILE=%127s", c->temp_profile);
+            if (sscanf(buf, "ALINK_BITRATE_OVERSHOOT_CONTROL=%15s", on) == 1 && truthy(on) >= 0)
+                c->os_control = truthy(on);
+            sscanf(buf, "ALINK_BITRATE_OVERSHOOT_MAX=%lf", &c->os_max);
         }
         fclose(f);
     } else
         fprintf(stderr, "warning: %s not found, using defaults\n", MASINA_CONF);
+    if (c->os_max < 1.05)
+        c->os_max = 1.05; /* the measurement is only good to a few % */
     char *colon = strrchr(camera, ':');
     snprintf(c->camera_port, sizeof(c->camera_port), "%s", colon ? colon + 1 : "80");
     if (colon) *colon = '\0';
@@ -398,6 +415,9 @@ typedef struct {
     int fd_n, fd_head;
     int temp, therm_fps, therm_level; /* degrees C (-1 unknown), thermal frame-rate cap (0 none), profile line */
     double therm_next;
+    double os_ok_since;   /* overshoot control: below OS_BACK x max since, -1 not */
+    int os_control;       /* overshoot control on (ALINK_BITRATE_OVERSHOOT_CONTROL, control port) */
+    double os_max;        /* its threshold (ALINK_BITRATE_OVERSHOOT_MAX, control port) */
 } alink_t;
 
 static int udp_fd = -1;
@@ -430,6 +450,8 @@ static size_t status_core(const alink_t *a, char *o, size_t size)
         n += snprintf(o + n, size - n, ";actual=%ldkbps;fps_cap=%d", a->actual, a->fps_cap);
     if (a->temp >= 0 && n < size)
         n += snprintf(o + n, size - n, ";temp=%dC;therm_fps=%d", a->temp, a->therm_fps);
+    if (n < size)
+        n += snprintf(o + n, size - n, ";overshoot_control=%d;overshoot_max=%.2f", a->os_control, a->os_max);
     return n < size ? n : size - 1;
 }
 
@@ -744,6 +766,49 @@ static void floor_frames(alink_t *a, const conf_t *c, double t)
     a->fd_last_change = t;
 }
 
+static void frames_up(alink_t *a, const conf_t *c, double t);
+
+/* ALINK_BITRATE_OVERSHOOT_CONTROL: the output at or above ALINK_BITRATE_OVERSHOOT_MAX x the target lowers the
+ * bitrate, at its floor the frame rate, congested or not. Without modem stats it also brings them back. */
+static void overshoot_control(alink_t *a, const conf_t *c, double t)
+{
+    const double settle = FD_WINDOW + FD_SETTLE;
+    if (a->actual < 0 || t - a->last_change < settle || t - a->fd_last_change < settle)
+        return; /* the window still holds frames from before the last change */
+    double r = a->actual / (a->current * 1.024); /* video0.bitrate is in units of 1024 bit/s */
+    if (r >= a->os_max) {
+        a->os_ok_since = -1;
+        if (a->current > clamp(a, c, 0)) {
+            double k = 1 / r; /* the overshoot says how far, at most the preset's biggest cut per step */
+            if (k < a->p->cut_floor)
+                k = a->p->cut_floor;
+            if (apply(a, c, (long)(a->current * k), "overshoot", NULL))
+                a->last_change = t;
+        } else
+            floor_frames(a, c, t);
+        return;
+    }
+    if (a->stats_ok) /* modem stats: the link decides when to go back up (control) */
+        return;
+    if (r >= a->os_max * OS_BACK) {
+        a->os_ok_since = -1;
+        return;
+    }
+    if (a->os_ok_since < 0)
+        a->os_ok_since = t;
+    if (t - a->os_ok_since < a->p->up_after)
+        return;
+    if (a->fps_cap < a->fps_full) {
+        frames_up(a, c, t); /* frames first */
+    } else if (a->current < a->manual) {
+        long step = (long)(a->current * OS_UP);
+        if (step < UP_MIN_STEP) step = UP_MIN_STEP;
+        long target = a->current + step > a->manual ? a->manual : a->current + step;
+        if (apply(a, c, target, "recover", NULL))
+            a->last_change = t;
+    }
+}
+
 /* link clear: the frame rate back up a step (before the bitrate goes up) */
 static void frames_up(alink_t *a, const conf_t *c, double t)
 {
@@ -886,7 +951,9 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
         if (!hold_up && a->fps_cap < a->fps_full && t - a->clear_since >= p->up_after) {
             if (t - a->fd_last_change >= FD_WINDOW + FD_SETTLE)
                 frames_up(a, c, t); /* frames first, the bitrate once they are all back */
-        } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP) {
+        } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP &&
+                   !(a->os_control && a->actual >= 0 && a->actual >= a->current * 1.024 * a->os_max * OS_BACK)) {
+            /* (with overshoot control: not while the output is still near the max, it would just overshoot again) */
             long step = (long)(a->current * p->up_step);
             if (t - a->cap_time >= CAP_VALID && step < p->max_bitrate * PROBE_STEP)
                 step = (long)(p->max_bitrate * PROBE_STEP);
@@ -931,6 +998,32 @@ static int command(alink_t *a, const conf_t *c, char *q)
             } else if (!on && a->enabled) {
                 a->enabled = 0;
                 release(a, c, "disable");
+            }
+        } else if (!strcmp(tok, "bitrate_overshoot_control")) {
+            int on = truthy(v);
+            if (on < 0) {
+                ok = 0;
+            } else if (on != a->os_control) {
+                a->os_control = on;
+                a->os_ok_since = -1;
+                report(a, on ? "overshoot_control_on" : "overshoot_control_off", a->current, NULL);
+                if (!on && a->enabled && a->current) { /* give back what it was holding down */
+                    if (a->fps_cap < a->fps_full) {
+                        a->fps_cap = a->fps_full;
+                        fps_update_r(a, c, "fps");
+                    }
+                    if (a->current < a->manual)
+                        apply(a, c, a->manual, "overshoot_control_off", NULL);
+                }
+            }
+        } else if (!strcmp(tok, "bitrate_overshoot_max")) {
+            char *end;
+            double x = strtod(v, &end);
+            if (end == v || x <= 0) {
+                ok = 0;
+            } else {
+                a->os_max = x < 1.05 ? 1.05 : x;
+                report(a, "overshoot_max", a->current, NULL);
             }
         } else if (!strcmp(tok, "preset")) {
             const preset_t *p = preset_find(v);
@@ -1025,13 +1118,15 @@ int main(int argc, char **argv)
     static conf_t c;
     conf_read(&c);
     static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9,
-                         .actual = -1, .fd_last_change = -1e9, .temp = -1, .therm_level = -1 };
+                         .actual = -1, .fd_last_change = -1e9, .temp = -1, .therm_level = -1, .os_ok_since = -1 };
     const char *name = argc > 1 ? argv[1] : c.preset;
     if (!(a.p = preset_find(name))) {
         fprintf(stderr, "unknown preset %s (performance, balanced, quality), using balanced\n", name);
         a.p = preset_find("balanced");
     }
     a.enabled = c.enabled;
+    a.os_control = c.os_control;
+    a.os_max = c.os_max;
     udp_open(c.ground_ip);
 
     int in = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -1094,8 +1189,11 @@ int main(int argc, char **argv)
             control_http(&a, &c);
         if (r > 0 && ctl_udp >= 0 && FD_ISSET(ctl_udp, &rd))
             control_udp(&a, &c);
-        if (a.enabled && a.current)
+        if (a.enabled && a.current) {
             fd_measure(&a, &c, t);
+            if (a.os_control)
+                overshoot_control(&a, &c, t);
+        }
         if (a.current)
             thermal(&a, &c, t); /* also while disabled: it protects the camera */
         if (a.enabled && a.current && a.stats_ok && t - a.last_stats >= STATS_TIMEOUT) {
