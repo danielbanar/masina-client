@@ -33,9 +33,17 @@
  *                interval-average fallback would read as clear.
  * Each is reported once when it starts (reason=edge / handover / no_service / service).
  *
- * Below 1 Mbit/s the frame rate goes down as well (/api/v1/set?video0.fps=): 40, 30, then 20 fps, so each frame keeps
- * about the bits it had at 1 Mbit/s and 60 fps. It also lowers the real floor: at 60 fps the encoder sends ~150 kbit/s
- * however low the bitrate is set.
+ * The bitrate does not go below ALINK_ENC_MIN (default 1000 kbit/s: waybeam does not encode below that). The encoder
+ * always gets the target; what it actually sends is not looked at, except in one case: congested with the bitrate
+ * already at that floor. Then the output is measured (transmit counters of the interface the stream leaves on, found
+ * from waybeam's outgoing.server and the routing table, or ALINK_IFACE; minus IP/UDP/RTP headers; over FD_WINDOW s),
+ * and if it is above the target the frame rate goes down (/api/v1/live/set?video0.fps=) to the step expected to fit
+ * (60 40 30 20 15 ..., not below ALINK_MIN_FPS): a detailed scene can need more than the floor at the full frame rate.
+ * Recovering, the frame rate goes back up first, a step at a time, and only then the bitrate.
+ *
+ * Thermal: the SoC temperature (/sys/devices/virtual/mstar/msys/TEMP_R) caps the frame rate by /etc/temp_profile.conf
+ * ("<min>-<max> <fps|-> <scale of the full rate|-> <update s>", first matching line), back up THERM_HYST degrees below
+ * the hotter band. This wins over everything and also works while disabled (replaces the thermal-throttle script).
  *
  * While enabled it owns the bitrate: a change from someone else (e.g. the ground station's bitrate slider) is where it
  * carries on from. The bitrate and frame rate the camera had when modem_alink took over, or the last change from
@@ -47,15 +55,19 @@
  *   echo 'preset=quality;enable=1' | nc -u -w1 <drone> 2226
  *
  * /etc/masina.conf: ALINK_ENABLED=true|false (default true), ALINK_PRESET (default balanced), ALINK_CAMERA=host[:port]
- * (default 127.0.0.1:80), ALINK_MIN_BITRATE=<kbit/s> (default 1), ALINK_CONTROL_PORT (default 2226), GROUND_IP: every
+ * (default 127.0.0.1:80), ALINK_MIN_BITRATE=<kbit/s> (default 1), ALINK_CONTROL_PORT (default 2226),
+ * ALINK_ENC_MIN=<kbit/s> (default 1000), ALINK_MIN_FPS (default 15), ALINK_IFACE=auto|<ifname> (default auto),
+ * ALINK_THERMAL=true|false (default true), ALINK_TEMP_PROFILE=<path> (default /etc/temp_profile.conf), GROUND_IP: every
  * change is sent there on port 2224 as "ALINK;time=...;enabled=...;preset=...;bitrate=...;...;reason=...".
  *
  * usage: modem_alink [performance|balanced|quality]      SIGINT/SIGTERM gives the camera back and exits
  */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +93,16 @@
 #define HTTP_TIMEOUT 1    /* s */
 #define EDGE_GAP 2.0      /* dB: a network rule this close to firing (search, handover, release): no raising */
 #define HO_GRACE 1.0      /* s after a cell change without cuts: the queue the switch built drains on the new cell */
+#define FD_SAMPLE 0.25    /* s between transmit-counter samples */
+#define FD_WINDOW 2.0     /* s the output is averaged over (covers a keyframe) */
+#define FD_SETTLE 0.75    /* s after a frame-rate change before a window counts, on top of FD_WINDOW */
+#define FD_OVER 1.05      /* at the floor, output above this share of the target means frames have to go */
+#define FD_AIM 0.90       /* drop to the step expected to give this share of the target */
+#define FD_HDR 40         /* bytes per packet that are not video: IPv4 20 + UDP 8 + RTP 12 (+14 on Ethernet) */
+#define FD_IFACE_EVERY 30.0 /* s between looking up the stream's route again */
+#define THERM_TEMP "/sys/devices/virtual/mstar/msys/TEMP_R"
+#define THERM_HYST 2      /* degrees below a band before going back up from it */
+#define THERM_MAX 16      /* profile lines */
 
 /* ---- presets */
 typedef struct {
@@ -106,11 +128,13 @@ static const preset_t PRESETS[] = {
     { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10 }, /* ~8 %/s */
 };
 
-/* below `below` kbit/s use `fps`; back up only at 20 % above the step, so the frame rate does not flap */
-static const struct {
-    long below;
-    int fps;
-} FPS_STEPS[] = { { 1000, 40 }, { 667, 30 }, { 500, 20 } };
+/* frame-rate steps, highest first: even decimations of the full rate (60: 60 40 30 20 15 12 10) */
+#define FD_NSTEPS 7
+static int fd_step(int full, int i)
+{
+    static const int num[FD_NSTEPS] = { 1, 2, 1, 1, 1, 1, 1 }, den[FD_NSTEPS] = { 1, 3, 2, 3, 4, 5, 6 };
+    return full * num[i] / den[i];
+}
 
 static volatile sig_atomic_t stop;
 static void on_sig(int s) { (void)s; stop = 1; }
@@ -148,6 +172,10 @@ typedef struct {
     char preset[32];
     int enabled, control_port;
     long min_bitrate; /* kbit/s */
+    long enc_min;     /* kbit/s: the encoder's own floor, the bitrate goes no lower */
+    int min_fps, thermal;
+    char iface[32];   /* "auto": the route to waybeam's outgoing.server */
+    char temp_profile[128];
 } conf_t;
 
 /* the last occurrence of a key wins, as in Config::readConfig */
@@ -158,6 +186,11 @@ static void conf_read(conf_t *c)
     c->enabled = 1;
     c->control_port = 2226;
     c->min_bitrate = 1;
+    c->enc_min = 1000;
+    c->min_fps = 15;
+    c->thermal = 1;
+    snprintf(c->iface, sizeof(c->iface), "auto");
+    snprintf(c->temp_profile, sizeof(c->temp_profile), "/etc/temp_profile.conf");
     FILE *f = fopen(MASINA_CONF, "r");
     if (f) {
         char buf[256];
@@ -169,6 +202,12 @@ static void conf_read(conf_t *c)
             sscanf(buf, "ALINK_CONTROL_PORT=%d", &c->control_port);
             if (sscanf(buf, "ALINK_ENABLED=%15s", on) == 1 && truthy(on) >= 0)
                 c->enabled = truthy(on);
+            sscanf(buf, "ALINK_ENC_MIN=%ld", &c->enc_min);
+            sscanf(buf, "ALINK_MIN_FPS=%d", &c->min_fps);
+            sscanf(buf, "ALINK_IFACE=%31s", c->iface);
+            if (sscanf(buf, "ALINK_THERMAL=%15s", on) == 1 && truthy(on) >= 0)
+                c->thermal = truthy(on);
+            sscanf(buf, "ALINK_TEMP_PROFILE=%127s", c->temp_profile);
         }
         fclose(f);
     } else
@@ -246,6 +285,39 @@ static int camera_set(const conf_t *c, const char *key, long value)
     return http_get(c, path, body, sizeof(body)) == 200;
 }
 
+/* not written to the camera's flash where it has /api/v1/live/set, else camera_set */
+static int camera_set_live(const conf_t *c, const char *key, long value)
+{
+    static int no_live;
+    char path[80], body[512];
+    if (!no_live) {
+        snprintf(path, sizeof(path), "/api/v1/live/set?%s=%ld", key, value);
+        int code = http_get(c, path, body, sizeof(body));
+        if (code == 200)
+            return 1;
+        if (code != 404)
+            return 0;
+        no_live = 1; /* older camera API */
+    }
+    return camera_set(c, key, value);
+}
+
+/* "value" of a string setting (outgoing.server -> udp://10.0.0.20:2222); 0 if not there */
+static int camera_get_str(const conf_t *c, const char *key, char *o, size_t size)
+{
+    char path[64], body[512];
+    snprintf(path, sizeof(path), "/api/v1/get?%s", key);
+    if (http_get(c, path, body, sizeof(body)) != 200)
+        return 0;
+    const char *p = strstr(body, "\"value\"");
+    if (!p || !(p = strchr(p + 7, '"')))
+        return 0;
+    p++;
+    int n = (int)strcspn(p, "\"");
+    snprintf(o, size, "%.*s", n, p);
+    return n > 0;
+}
+
 /* ---- modem_link stats */
 typedef struct {
     int has_qdelay, has_queue, has_ul, has_standing, has_trigger, has_cell;
@@ -317,6 +389,15 @@ typedef struct {
     int edge;             /* a network rule is close to firing (EDGE_GAP) */
     int cell;             /* serving cell: 0 not seen yet, 1 there (earfcn, pci), 2 lost */
     double earfcn, pci, grace_until;
+    int fps_cap;          /* frame rate allowed at the bitrate floor (fps_full when not dropping) */
+    long actual;          /* kbit/s the stream measures over FD_WINDOW, -1 unknown */
+    char iface[32];       /* interface the stream leaves on */
+    int iface_hdr;        /* non-video bytes per packet on it */
+    double iface_next, fd_next, fd_last_change;
+    struct { double t, bytes, pkts; } fd_ring[16];
+    int fd_n, fd_head;
+    int temp, therm_fps, therm_level; /* degrees C (-1 unknown), thermal frame-rate cap (0 none), profile line */
+    double therm_next;
 } alink_t;
 
 static int udp_fd = -1;
@@ -343,8 +424,13 @@ static size_t status_core(const alink_t *a, char *o, size_t size)
     char tm[16];
     time_t wall = time(NULL);
     strftime(tm, sizeof(tm), "%H:%M:%S", localtime(&wall));
-    return snprintf(o, size, "ALINK;time=%s;enabled=%d;preset=%s;bitrate=%ldkbps;max=%ldkbps;fps=%d", tm, a->enabled, a->p->name,
-                    a->current, a->p->max_bitrate, a->fps);
+    size_t n = snprintf(o, size, "ALINK;time=%s;enabled=%d;preset=%s;bitrate=%ldkbps;max=%ldkbps;fps=%d", tm, a->enabled,
+                        a->p->name, a->current, a->p->max_bitrate, a->fps);
+    if (a->actual >= 0 && n < size)
+        n += snprintf(o + n, size - n, ";actual=%ldkbps;fps_cap=%d", a->actual, a->fps_cap);
+    if (a->temp >= 0 && n < size)
+        n += snprintf(o + n, size - n, ";temp=%dC;therm_fps=%d", a->temp, a->therm_fps);
+    return n < size ? n : size - 1;
 }
 
 static size_t num_or_na(char *o, size_t size, const char *key, int ok, double v, int prec, const char *unit)
@@ -392,6 +478,11 @@ static int camera_sync(alink_t *a, const conf_t *c)
         return 0;
     }
     a->camera_ok = 1;
+    if (a->fps != a->fps_full) { /* we lowered it: an encoder restart puts the configured rate back */
+        long f = camera_get(c, "video0.fps");
+        if (f > 0 && f != a->fps)
+            a->fps = (int)f; /* the next fps_update sets ours again */
+    }
     if (labs(b - a->current) > a->current / 50) {
         long prev = a->current;
         a->current = a->manual = b;
@@ -406,33 +497,35 @@ static int camera_sync(alink_t *a, const conf_t *c)
 static long clamp(const alink_t *a, const conf_t *c, long target)
 {
     long hi = a->p->max_bitrate;
-    long lo = c->min_bitrate < hi ? c->min_bitrate : hi;
+    long lo = c->min_bitrate > c->enc_min ? c->min_bitrate : c->enc_min; /* the encoder goes no lower anyway */
+    if (lo > hi) lo = hi;
     if (target < lo) target = lo;
     if (target > hi) target = hi;
     return target;
 }
 
-/* below 1 Mbit/s fewer frames (FPS_STEPS), back to the full rate when the bitrate recovers */
-static void fps_update(alink_t *a, const conf_t *c)
+/* the frame rate: full, or lower at the bitrate floor (fps_cap, while enabled) or when hot (therm_fps, always).
+ * Returns 1 if it changed, 0 if not, -1 if the camera refused it. */
+static int fps_update_r(alink_t *a, const conf_t *c, const char *reason)
 {
     int fps = a->fps_full;
-    for (size_t i = 0; i < sizeof(FPS_STEPS) / sizeof(FPS_STEPS[0]); i++) {
-        long below = FPS_STEPS[i].below;
-        if (a->fps <= FPS_STEPS[i].fps)
-            below = below * 6 / 5; /* already at or under this step: leave it only at 20 % above */
-        if (a->current < below && FPS_STEPS[i].fps < fps)
-            fps = FPS_STEPS[i].fps;
-    }
+    if (a->enabled && a->fps_cap > 0 && a->fps_cap < fps)
+        fps = a->fps_cap;
+    if (a->therm_fps > 0 && a->therm_fps < fps)
+        fps = a->therm_fps;
     if (fps == a->fps || now() < a->fps_retry)
-        return;
-    if (!camera_set(c, "video0.fps", fps)) {
+        return 0;
+    if (!camera_set_live(c, "video0.fps", fps)) {
         fprintf(stderr, "camera %s:%s did not accept %d fps\n", c->camera_host, c->camera_port, fps);
         a->fps_retry = now() + FPS_RETRY;
-        return;
+        return -1;
     }
     a->fps = fps;
-    report(a, "fps", a->current, NULL);
+    report(a, reason, a->current, NULL);
+    return 1;
 }
+
+static void fps_update(alink_t *a, const conf_t *c) { fps_update_r(a, c, "fps"); }
 
 /* returns 1 if the bitrate changed */
 static int apply(alink_t *a, const conf_t *c, long target, const char *reason, const link_t *l)
@@ -467,7 +560,12 @@ static void camera_attach(alink_t *a, const conf_t *c, const char *reason)
     long f = camera_get(c, "video0.fps");
     a->camera_ok = 1;
     a->current = a->manual = b;
-    a->fps = a->fps_full = f > 0 ? (int)f : FPS_DEFAULT;
+    int cam_fps = f > 0 ? (int)f : FPS_DEFAULT;
+    /* the camera may be at a rate we lowered (thermal, also while disabled): that is not its full rate */
+    if (!(a->fps_full > 0 && cam_fps == a->fps && a->fps < a->fps_full))
+        a->fps_full = cam_fps;
+    a->fps = cam_fps;
+    a->fps_cap = a->fps_full;
     a->was_congested = 0;
     a->clear_since = -1;
     report(a, reason, b, NULL);
@@ -486,8 +584,11 @@ static void release(alink_t *a, const conf_t *c, const char *reason)
     camera_sync(a, c); /* a change from someone else just now is what stays */
     if (a->current != a->manual && camera_set(c, "video0.bitrate", a->manual))
         a->current = a->manual;
-    if (a->fps != a->fps_full && camera_set(c, "video0.fps", a->fps_full))
-        a->fps = a->fps_full;
+    a->fps_cap = a->fps_full;
+    /* the frame rate goes back too, but not above the thermal cap while alink keeps running */
+    int back = strcmp(reason, "exit") && a->therm_fps > 0 && a->therm_fps < a->fps_full ? a->therm_fps : a->fps_full;
+    if (a->fps != back && camera_set_live(c, "video0.fps", back))
+        a->fps = back;
     report(a, reason, prev, NULL);
 }
 
@@ -510,6 +611,231 @@ static void link_state(alink_t *a, const link_t *l, double t)
     } else if (a->cell == 1) {
         a->cell = 2;
         report(a, "no_service", a->current, l);
+    }
+}
+
+/* ---- frame rate at the bitrate floor */
+static int read_counter(const char *iface, const char *name, double *v)
+{
+    char path[96];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/%s", iface, name);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    unsigned long long x;
+    int ok = fscanf(f, "%llu", &x) == 1;
+    fclose(f);
+    *v = (double)x;
+    return ok;
+}
+
+/* the interface the stream leaves on: ALINK_IFACE, or the most specific route to waybeam's outgoing.server */
+static void fd_iface(alink_t *a, const conf_t *c, double t)
+{
+    if (t < a->iface_next)
+        return;
+    a->iface_next = t + FD_IFACE_EVERY;
+    char name[32] = "";
+    if (strcmp(c->iface, "auto")) {
+        snprintf(name, sizeof(name), "%s", c->iface);
+    } else {
+        char server[128], host[64];
+        if (!camera_get_str(c, "outgoing.server", server, sizeof(server)))
+            return; /* keep what we had */
+        const char *h = strstr(server, "://");
+        h = h ? h + 3 : server;
+        snprintf(host, sizeof(host), "%.*s", (int)strcspn(h, ":/"), h);
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res;
+        if (!*host || getaddrinfo(host, NULL, &hints, &res) != 0)
+            return;
+        uint32_t dst = ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr;
+        freeaddrinfo(res);
+        FILE *f = fopen("/proc/net/route", "r");
+        if (!f)
+            return;
+        char line[256], ifn[32];
+        unsigned int d, g, fl, m;
+        int best = -1;
+        while (fgets(line, sizeof(line), f)) /* addresses are hex in memory order, as s_addr */
+            if (sscanf(line, "%31s %x %x %x %*d %*d %*d %x", ifn, &d, &g, &fl, &m) == 5 && (fl & 1) && (dst & m) == d &&
+                __builtin_popcount(m) > best) {
+                best = __builtin_popcount(m);
+                snprintf(name, sizeof(name), "%s", ifn);
+            }
+        fclose(f);
+    }
+    if (strcmp(name, a->iface)) {
+        snprintf(a->iface, sizeof(a->iface), "%s", name);
+        a->fd_n = 0;
+        a->iface_hdr = FD_HDR;
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/class/net/%s/type", name);
+        FILE *f = fopen(path, "r");
+        int type = 0;
+        if (f) {
+            if (fscanf(f, "%d", &type) != 1) type = 0;
+            fclose(f);
+        }
+        if (type == 1) /* ARPHRD_ETHER: the counters include the 14-byte Ethernet header */
+            a->iface_hdr += 14;
+        fprintf(stderr, "measuring the stream on %s\n", *name ? name : "(no route)");
+    }
+}
+
+/* what the stream actually sends, kbit/s over FD_WINDOW (a->actual) */
+static void fd_measure(alink_t *a, const conf_t *c, double t)
+{
+    fd_iface(a, c, t);
+    if (!*a->iface || t < a->fd_next)
+        return;
+    a->fd_next = t + FD_SAMPLE;
+    double bytes, pkts;
+    if (!read_counter(a->iface, "tx_bytes", &bytes) || !read_counter(a->iface, "tx_packets", &pkts)) {
+        a->actual = -1;
+        a->fd_n = 0;
+        return;
+    }
+    const int N = sizeof(a->fd_ring) / sizeof(a->fd_ring[0]);
+    a->fd_ring[a->fd_head].t = t;
+    a->fd_ring[a->fd_head].bytes = bytes;
+    a->fd_ring[a->fd_head].pkts = pkts;
+    int newest = a->fd_head;
+    a->fd_head = (a->fd_head + 1) % N;
+    if (a->fd_n < N)
+        a->fd_n++;
+    for (int k = 1; k < a->fd_n; k++) { /* the newest sample at least FD_WINDOW old */
+        int i = (newest - k + N) % N;
+        if (t - a->fd_ring[i].t < FD_WINDOW)
+            continue;
+        double dt = t - a->fd_ring[i].t, db = bytes - a->fd_ring[i].bytes, dp = pkts - a->fd_ring[i].pkts;
+        if (db < 0 || dp < 0) { /* counters reset */
+            a->fd_n = 0;
+            return;
+        }
+        double kbps = (db - dp * a->iface_hdr) * 8 / dt / 1000;
+        a->actual = kbps > 0 ? (long)kbps : 0;
+        return;
+    }
+}
+
+/* congested with the bitrate at its floor: if the output is still above the target, fewer frames (the step expected
+ * to fit, not below ALINK_MIN_FPS) */
+static void floor_frames(alink_t *a, const conf_t *c, double t)
+{
+    if (a->actual < 0 || t - a->fd_last_change < FD_WINDOW + FD_SETTLE || t - a->last_change < FD_WINDOW + FD_SETTLE)
+        return; /* no measurement yet, or it still holds frames from before the last change */
+    double r = a->actual / (a->current * 1.024); /* video0.bitrate is in units of 1024 bit/s */
+    if (r < FD_OVER)
+        return;
+    double want = a->fps * FD_AIM / r;
+    int next = -1;
+    for (int i = 0; i < FD_NSTEPS; i++) {
+        int st = fd_step(a->fps_full, i);
+        if (st < a->fps && st >= c->min_fps) {
+            next = st;
+            if (st <= want)
+                break;
+        }
+    }
+    if (next < 0)
+        return; /* at ALINK_MIN_FPS */
+    a->fps_cap = next;
+    fps_update_r(a, c, "floor_fps");
+    a->fd_last_change = t;
+}
+
+/* link clear: the frame rate back up a step (before the bitrate goes up) */
+static void frames_up(alink_t *a, const conf_t *c, double t)
+{
+    int up = a->fps_full;
+    for (int i = FD_NSTEPS - 1; i >= 0; i--)
+        if (fd_step(a->fps_full, i) > a->fps_cap) {
+            up = fd_step(a->fps_full, i);
+            break;
+        }
+    a->fps_cap = up;
+    fps_update_r(a, c, "recover_fps");
+    a->fd_last_change = t;
+}
+
+/* ---- thermal throttling */
+typedef struct { int min, max, fps; double scale, update; } therm_line_t;
+
+/* /etc/temp_profile.conf: "<min>-<max> <fps|-> <scale|-> <update s>"; built-in default if missing */
+static int therm_profile(const conf_t *c, therm_line_t *p)
+{
+    int n = 0;
+    FILE *f = fopen(c->temp_profile, "r");
+    if (f) {
+        char line[160], fps[16], scale[16], upd[16];
+        int lo, hi;
+        while (n < THERM_MAX && fgets(line, sizeof(line), f)) {
+            if (line[0] == '#' || line[0] == '\n')
+                continue;
+            int k = sscanf(line, "%d-%d %15s %15s %15s", &lo, &hi, fps, scale, upd);
+            if (k < 2) {
+                k = sscanf(line, "%d%*[+-] %15s %15s %15s", &lo, fps, scale, upd);
+                hi = 9999;
+                if (k < 1) continue;
+                k++;
+            }
+            p[n].min = lo;
+            p[n].max = hi;
+            p[n].fps = k >= 3 && strcmp(fps, "-") ? atoi(fps) : 0;
+            p[n].scale = k >= 4 && strcmp(scale, "-") ? atof(scale) : 0;
+            p[n].update = k >= 5 && strcmp(upd, "-") ? atof(upd) : 5;
+            n++;
+        }
+        fclose(f);
+    }
+    if (!n) { /* the profile the camera ships with */
+        const therm_line_t def[] = { { 0, 70, 0, 1, 5 }, { 70, 80, 0, 0.5, 5 }, { 80, 85, 15, 0, 5 }, { 85, 999, 3, 0, 5 } };
+        memcpy(p, def, sizeof(def));
+        n = sizeof(def) / sizeof(def[0]);
+    }
+    return n;
+}
+
+static void thermal(alink_t *a, const conf_t *c, double t)
+{
+    if (!c->thermal || t < a->therm_next)
+        return;
+    a->therm_next = t + 5;
+    FILE *f = fopen(THERM_TEMP, "r");
+    if (!f)
+        return;
+    char buf[64];
+    int temp = -1;
+    if (fgets(buf, sizeof(buf), f)) {
+        char *p = buf + strcspn(buf, "0123456789");
+        if (*p) temp = atoi(p);
+    }
+    fclose(f);
+    if (temp < 0)
+        return;
+    a->temp = temp;
+    therm_line_t prof[THERM_MAX];
+    int n = therm_profile(c, prof), level = -1;
+    for (int i = 0; i < n; i++)
+        if (temp >= prof[i].min && temp <= prof[i].max) {
+            level = i;
+            break;
+        }
+    if (level < 0)
+        return;
+    /* cooler band: only once THERM_HYST below the hotter one, so a temperature on the edge does not flap */
+    if (a->therm_level >= 0 && level < a->therm_level && level < n && temp > prof[a->therm_level].min - THERM_HYST)
+        level = a->therm_level;
+    a->therm_next = t + (prof[level].update > 0 ? prof[level].update : 5);
+    int fps = prof[level].fps > 0 ? prof[level].fps
+            : prof[level].scale > 0 && prof[level].scale < 1 ? (int)(a->fps_full * prof[level].scale) : 0;
+    if (fps >= a->fps_full)
+        fps = 0;
+    a->therm_level = level;
+    if (fps != a->therm_fps) {
+        a->therm_fps = fps;
+        if (fps_update_r(a, c, "thermal") == 0)
+            report(a, "thermal", a->current, NULL); /* the cap changed without changing the frame rate */
     }
 }
 
@@ -548,12 +874,19 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
             cut = !a->was_congested || drain_kb >= a->last_queue; /* no rate: cut again only while the queue grows */
         if (target < a->current * p->cut_floor)
             target = a->current * p->cut_floor;
-        if (cut && !grace && t - a->last_change >= MIN_GAP && apply(a, c, (long)target, "congestion", l))
-            a->last_change = t;
+        if (cut && !grace && t - a->last_change >= MIN_GAP) {
+            if (apply(a, c, (long)target, "congestion", l))
+                a->last_change = t;
+            else if (a->current <= clamp(a, c, 0))
+                floor_frames(a, c, t); /* the bitrate is at its floor: frames are next */
+        }
     } else if (clear) {
         if (a->clear_since < 0)
             a->clear_since = t;
-        if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP) {
+        if (!hold_up && a->fps_cap < a->fps_full && t - a->clear_since >= p->up_after) {
+            if (t - a->fd_last_change >= FD_WINDOW + FD_SETTLE)
+                frames_up(a, c, t); /* frames first, the bitrate once they are all back */
+        } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP) {
             long step = (long)(a->current * p->up_step);
             if (t - a->cap_time >= CAP_VALID && step < p->max_bitrate * PROBE_STEP)
                 step = (long)(p->max_bitrate * PROBE_STEP);
@@ -691,7 +1024,8 @@ int main(int argc, char **argv)
 {
     static conf_t c;
     conf_read(&c);
-    static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9 };
+    static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9,
+                         .actual = -1, .fd_last_change = -1e9, .temp = -1, .therm_level = -1 };
     const char *name = argc > 1 ? argv[1] : c.preset;
     if (!(a.p = preset_find(name))) {
         fprintf(stderr, "unknown preset %s (performance, balanced, quality), using balanced\n", name);
@@ -760,6 +1094,10 @@ int main(int argc, char **argv)
             control_http(&a, &c);
         if (r > 0 && ctl_udp >= 0 && FD_ISSET(ctl_udp, &rd))
             control_udp(&a, &c);
+        if (a.enabled && a.current)
+            fd_measure(&a, &c, t);
+        if (a.current)
+            thermal(&a, &c, t); /* also while disabled: it protects the camera */
         if (a.enabled && a.current && a.stats_ok && t - a.last_stats >= STATS_TIMEOUT) {
             a.stats_ok = 0;
             report(&a, "no_data", a.current, NULL); /* the bitrate stays where it is until stats come back */
