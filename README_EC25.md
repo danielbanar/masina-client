@@ -531,6 +531,124 @@ Printed once when `modem_link` stops: `<model>;event=summary;...`
 
 ---
 
+## Value ranges
+
+Normal / warning / bad bands for every interval field, for a display or an OSD. They come from a 45 min flight on
+28 Oct 2026 (this EC25, cells 186 / 127 / 10 on 1850 / 3500 / 6400): "normal" is where calm flying sat, "warning"
+what the 5 s before the 7 queue build-ups looked like, "bad" what they looked like during. Temperature and supply
+voltage come from the EC25 spec instead. Scale ends are the 3GPP / modem limits, or what that flight reached where
+there are none. One flight in one area: the direction of each band is solid, the exact numbers want checking
+against more logs. The RLC counters, `ul_buf_min`, `qdelay_min`, `trigger_held` and the raw counts rest on few
+events; prefer the percentage where a count and a percentage cover the same thing.
+
+What that flight showed: every queue build-up started with the modem out of transmit power (`ul_pwrlim` ~100 %,
+`pathloss` ≥ 121 dB). The best early warnings were `rsrp`, `pathloss`, `ul_coderate`, `ul_txpwr`, `trigger_gap`,
+`phr`, `ul_pwrlim` and `ul_mod` = QPSK, a few seconds ahead (`pathloss ≥ 118` up to ~16 s, `rsrp0 ≤ −110` up to
+~26 s). `qdelay` itself, `ul_grant`, `ul_rate`, `dl_bler` and `rlm_oos` gave no lead. `t310` came on only after
+the connection had already been released (13:26:05, release at 13:26:04.859) and 3 more times with nothing
+following, so it is no warning on its own.
+
+```
+field [unit]: scale MIN..MAX | normal A..B | warning A..B | bad A..B
+Only change state after it holds ~1 s (4 lines). NA = no data, not bad.
+"info only" = identifier or traffic-dependent value, show it without colour.
+
+time: info only (HH:MM:SS, drone clock)
+
+DOWNLINK
+dl_tbs [count]: scale 0..150 | info only (depends on traffic)
+dl_bler [%]: scale 0..100 | normal 0..10 | warning 10..20 | bad 20..100
+dl_harq_retx [count]: scale 0..30 | normal 0..6 | warning 6..10 | bad 10..30
+dl_harq_retx_pct [%]: scale 0..100 | normal 0..10 | warning 10..20 | bad 20..100
+dl_resid [count]: scale 0..10 | normal 0 | warning 1..10
+dl_mcs: scale 0..28 | normal 0 or 8..28 | warning 5..8 | bad above 0 up to 5 (0 = nothing scheduled, not bad)
+dl_rbs: scale 0..50 | info only (depends on traffic)
+dl_mimo [%]: scale 0..100 | normal 0 or 50..100 | warning 20..50 | bad above 0 up to 20 (0 = little traffic, not bad)
+dl_rate [Mbps]: scale 0..1 | info only (control traffic only)
+pdcch_agg: scale 1..8 | normal 1..1.5 | warning 1.5..4 | bad 4..8
+
+UPLINK
+ul_tx [count]: scale 0..300 | info only (depends on traffic)
+ul_harq_retx [count]: scale 0..80 | normal 0..13 | warning 13..25 | bad 25..80
+ul_harq_retx_pct [%]: scale 0..100 | normal 0..10 | warning 10..15 | bad 15..100
+ul_nack [count]: scale 0..45 | normal 0..7 | warning 7..15 | bad 15..45
+ul_nack_pct [%]: scale 0..100 | normal 0..5 | warning 5..10 | bad 10..100
+ul_rate [Mbps]: scale 0..25 | info only (compare with ul_grant and the video bitrate)
+ul_grant [Mbps]: scale 0..30 | rate it as ul_grant / video bitrate: normal 1.3..3 | warning 1.0..1.3 | bad 0..1.0
+ul_grant_used [%]: scale 0..100 | normal 0..98 | warning 98..100 brief | bad 100 for > 1 s
+ul_rbs: scale 0..100 | info only
+ul_mod: normal 16QAM or 64QAM | warning QPSK < 1 s | bad QPSK > 1 s
+ul_coderate: scale 0..1 | normal 0.70..1 | warning 0.45..0.70 | bad 0..0.45
+ul_pwr [dBm]: scale -40..80 | normal -40..23 | warning 23..33 | bad 33..80
+ul_txpwr [dBm]: scale -40..23 | normal -40..20 | warning 20..22 | bad 22..23
+ul_pwrlim [%]: scale 0..100 | normal 0..50 | warning 50..90 | bad 90..100
+ul_pc_corr [dB]: scale -20..15 | info only
+pathloss [dB]: scale 70..165 | normal 70..118 | warning 118..125 | bad 125..165
+
+UPLOAD QUEUE
+ul_buf [KB]: scale 0..300 | normal 0..20 | warning 20..50 | bad 50..300
+ul_buf_max [KB]: scale 0..300 | normal 0..40 | warning 40..100 | bad 100..300
+ul_buf_min [KB]: scale 0..300 | normal 0..2 | warning 2..10 | bad 10..300
+bsr [KB]: scale 0..150 | normal 0..15 | warning 15..50 | bad 50..150 (stops at 150)
+qdelay [ms]: scale 0..1000 | normal 0..25 | warning 25..100 | bad 100..1000+
+qdelay_max [ms]: scale 0..1000 | normal 0..50 | warning 50..150 | bad 150..1000+
+qdelay_min [ms]: scale 0..1000 | normal 0..10 | warning 10..50 | bad 50..1000+
+qwarn: normal 0 | warning 1 | bad 1 for > 1 s
+phr [dB]: scale -23..40 | normal 5..40 | warning -10..5 | bad -23..-10
+
+RLC / PDCP (NA in most lines, reported every ~1.3 s)
+rlc_ul_retx [count]: scale 0..50 | normal 0..10 | warning 10..30 | bad 30..50+
+rlc_ul_nack [count]: scale 0..25 | normal 0..2 | warning 2..10 | bad 10..25
+rlc_ul_tpoll [count]: scale 0..1 | normal 0 | warning 1
+rlc_dl_retx [count]: scale 0..130 | normal 0..5 | warning 5..20 | bad 20..130
+rlc_dl_nack [count]: scale 0..260 | normal 0..5 | warning 5..30 | bad 30..260
+rlc_dl_drop [count]: scale 0..15 | normal 0 | warning 1..3 | bad 4..15
+rlc_dl_treord [count]: scale 0..30 | normal 0..2 | warning 2..10 | bad 10..30
+pdcp_ul_discard [count]: scale 0..300 | normal 0 | bad 1..300 (video was lost)
+
+CHANNEL QUALITY
+cqi0, cqi1: scale 0..15 | normal 9..15 | warning 6..8 | bad 0..5
+ri: scale 1..2 | normal 2 | warning 1 (weak sign: one stream instead of two)
+
+MODEM
+temp [C]: scale -40..85 | normal -30..60 | warning 60..70 or -35..-30 | bad 70..85 or -40..-35
+vbat [V]: scale 3.0..5.0 | normal 3.4..4.3 | warning 3.3..3.4 | bad 3.0..3.3 or 4.3..5.0 (above 4.7 = over the EC25's absolute maximum: cut power, check the supply)
+
+SERVING CELL
+earfcn: info only (frequency channel)
+pci: info only (cell ID)
+rsrp0, rsrp1 [dBm]: scale -140..-44 | normal -105..-44 | warning -112..-105 | bad -140..-112 (below -140 = invalid, treat as NA)
+rsrp_diff [dB]: scale -20..20 | normal -6..6 | warning -10..-6 or 6..10 | bad -20..-10 or 10..20 (lasting)
+snr0, snr1 [dB]: scale -20..30 | normal 5..30 | warning -3..5 | bad -20..-3
+rsrq [dB]: scale -30..-3 | normal -12..-3 | warning -17..-12 | bad -30..-17
+rssi [dBm]: scale -110..-30 | info only (depends on how busy the cell is)
+
+NEIGHBOURS AND HANDOVER
+ncells [count]: scale 0..6 | info only
+nb_earfcn: info only
+nb_pci: info only
+nb_rsrp [dBm]: scale -140..-44 | info only
+nb_rsrq [dB]: scale -30..-3 | info only
+ho_margin [dB]: scale -10..35 | normal 6..35 | warning 3..6 | bad -10..3 (handover coming, not trouble in itself)
+trigger: info only (network rule closest to firing: A1 = signal got better, A2 = signal weak, A3/A5 = handover; @number = frequency)
+trigger_gap [dB]: scale -40..50 | normal 8..50 | warning 3..8 | bad -40..3
+trigger_nb [dBm]: info only (neighbour the rule is watching)
+trigger_held [ms]: scale 0..700 | normal 0 | warning 1..700 (rule already met, about to fire)
+trigger_ttt [ms]: info only (network setting: how long a rule must hold)
+
+RADIO LINK
+rlm_oos (raw number, not %): normal 0 | warning above 0
+t310: normal 0 | warning 1 (unreliable alone, never fired before a drop)
+
+COMBINED LINK STATE
+warning: any 2 of: pathloss >= 118, rsrp0 <= -105, ul_pwrlim >= 50, ul_mod = QPSK (holding 1 s)
+bad: qdelay > 100, or ul_buf > 50, or pdcp_ul_discard > 0, or (pathloss > 125 and ul_pwrlim > 90)
+```
+
+Fields added after that flight (`bw`, `cell_id`, `enb`) have no bands: they are identifiers, show them as info.
+
+---
+
 ## modem_alink
 
 Sets the camera's encoder bitrate over its HTTP API (`/api/v1/set?video0.bitrate=<kbit/s>`, and `video0.fps` below
