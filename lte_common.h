@@ -370,6 +370,10 @@ __attribute__((unused)) static double parse_volt(const char *v)
 #define LOG_RRC_OTA  0xB0C0  /* LTE RRC OTA message (lte_rrc.h) */
 #define LOG_RACH_TRIG 0xB061 /* LTE MAC RACH trigger */
 #define LOG_RACH_ATT 0xB062  /* LTE MAC RACH attempt */
+#define LOG_NAS_ESM_IN  0xB0E2  /* LTE NAS ESM plain OTA incoming message (lte_rrc.h mob_nas) */
+#define LOG_NAS_ESM_OUT 0xB0E3  /* LTE NAS ESM plain OTA outgoing message */
+#define LOG_NAS_EMM_IN  0xB0EC  /* LTE NAS EMM plain OTA incoming message */
+#define LOG_NAS_EMM_OUT 0xB0ED  /* LTE NAS EMM plain OTA outgoing message */
 
 /* RLC/PDCP counters (increase over the interval, all radio bearers) */
 enum { RLC_UL_RETX, RLC_UL_NACK, RLC_UL_TPOLL, RLC_DL_RETX, RLC_DL_NACK, RLC_DL_DROP, RLC_DL_TREORD, PDCP_UL_DISCARD, L2_N };

@@ -12,6 +12,12 @@ Drone-side programs for an OpenIPC camera (SSC338Q, waybeam encoder) flying over
 All of them read `/etc/masina.conf`; `enabled=true` there starts them at boot. `update_masina` (run by
 `S90masinaclient`) points waybeam's `outgoing.server` at `udp://GROUND_IP:2222` on every start.
 
+Besides the radio statistics, `modem_link` reads the serving cell over AT every 5 s and prints its channel bandwidth
+(`bw`, MHz), cell identity (`cell_id`) and base station (`enb` = `cell_id` / 256: a change means another tower), NA
+without an AT port. It also prints the modem's NAS messages to the core network as `event=nas` lines (attach, detach,
+tracking area update, service request / reject, with the cause on rejects, e.g. `cause=10:implicitly_detached`); the
+summary counts rejects and network detaches as `nas_rejects`.
+
 ---
 
 ## modem_alink
