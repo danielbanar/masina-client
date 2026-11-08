@@ -852,16 +852,17 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
             a->change_t = t;
         }
         double target = a->current * p->down_factor;
-        int cut;
+        /* cut unless the standing queue is draining (on course to be gone within LADDER_DRAIN s since the last change):
+         * the queue decides, not the uplink rate (a high rate with a standing queue never read as too much) */
+        double since = t - a->change_t, fell = a->change_queue - drain_kb;
+        int cut = !(fell > 0 && since > 0 && drain_kb / (fell / since) <= LADDER_DRAIN);
         if (l->has_ul) {
             a->cap = l->ul_rate * 1000; /* with a queue waiting, the modem sends all the link gives it */
             a->cap_time = t;
             double aim = a->cap * p->ul_share - drain_kb * 8 / p->drain; /* kbit/s */
-            cut = a->current > aim;
             if (aim < target)
                 target = aim;
-        } else
-            cut = !a->was_congested || drain_kb >= a->last_queue; /* no rate: cut again only while the queue grows */
+        }
         if (target < a->current * p->cut_floor)
             target = a->current * p->cut_floor;
         if (cut && !grace && t - a->last_change >= MIN_GAP && apply(a, c, (long)target, "congestion", l)) {
