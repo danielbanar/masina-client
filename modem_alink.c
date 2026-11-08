@@ -39,7 +39,9 @@
  * from waybeam's outgoing.server and the routing table, or ALINK_IFACE; minus IP/UDP/RTP headers; over FD_WINDOW s),
  * and while it is above the target the picture gets cheaper, one stage per measurement: the frame rate to half (60 ->
  * 30), then the ISP noise set (despike 15, sharpness 0, grayscale; the camera's own values are kept to put back), then
- * the frame rate lower, to the step expected to fit (20 15 12 10, not below ALINK_MIN_FPS). A dark, high-gain or very
+ * the frame rate lower, to the step expected to fit (20 15 12 10, not below ALINK_MIN_FPS). The performance preset
+ * starts the ladder already at 2000 kbit/s, alongside the bitrate cuts (ALINK_LADDER_FROM overrides, 0 = only at the
+ * floor). A dark, high-gain or very
  * detailed scene can need far more than the floor at the full frame rate. Recovering goes back the same way: the frame
  * rate up to half, the ISP settings back, the frame rate to full, and only then the bitrate.
  * ALINK_BITRATE_OVERSHOOT_CONTROL=true also watches the output all the time: at or above ALINK_BITRATE_OVERSHOOT_MAX
@@ -71,7 +73,8 @@
  *
  * /etc/masina.conf: ALINK_ENABLED=true|false (default true), ALINK_PRESET (default balanced), ALINK_CAMERA=host[:port]
  * (default 127.0.0.1:80), ALINK_MIN_BITRATE=<kbit/s> (default 1), ALINK_CONTROL_PORT (default 2226),
- * ALINK_ENC_MIN=<kbit/s> (default 1000), ALINK_MIN_FPS (default 15), ALINK_IFACE=auto|<ifname> (default auto),
+ * ALINK_ENC_MIN=<kbit/s> (default 1000; waybeam clamps anything lower to 1000), ALINK_LADDER_FROM=<kbit/s> (default:
+ * the preset's), ALINK_MIN_FPS (default 15), ALINK_IFACE=auto|<ifname> (default auto),
  * ALINK_THERMAL=true|false (default true), ALINK_TEMP_PROFILE=<path> (default /etc/temp_profile.conf),
  * ALINK_BITRATE_OVERSHOOT_CONTROL=true|false (default false), ALINK_BITRATE_OVERSHOOT_MAX=<x> (default 1.5),
  * ALINK_ISP_DESPIKE=<0..15>, ALINK_ISP_SHARPNESS=<0..255>, ALINK_ISP_GRAYSCALE=true|false (default: not set), GROUND_IP: every
@@ -149,15 +152,17 @@ typedef struct {
     double up_after, up_step;          /* raise after up_after s clear, by up_step of the bitrate per line */
     double qmin_high, qmin_clear;      /* standing queue (qdelay_min, ms): congested at >= qmin_high with
                                         * >= qbytes_min KB still queued (or >= qbytes_high KB), clear below qmin_clear */
+    long ladder_from;                  /* kbit/s: the floor's ladder (30 fps, ISP stage, lower fps) already starts at or
+                                        * below this, alongside the bitrate cuts; 0 = only at the floor */
 } preset_t;
 
 /* the small qbytes_min keeps a near-idle link from looking congested: modem_link floors the rate at 0.5 Mbit/s,
  * so a 3 KB burst alone already reads as 50 ms */
 static const preset_t PRESETS[] = {
-    /*               max     congested       aim          cut           clear     raise            standing */
-    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075,     10, 3 },  /* ~3 %/s */
-    { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125,     20, 5 },  /* ~5 %/s */
-    { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10 }, /* ~8 %/s */
+    /*               max     congested       aim          cut           clear     raise            standing  ladder */
+    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075,     10, 3,    2000 }, /* ~3 %/s */
+    { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125,     20, 5,    0 },    /* ~5 %/s */
+    { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10,   0 },    /* ~8 %/s */
 };
 
 /* frame-rate steps, highest first: even decimations of the full rate (60: 60 40 30 20 15 12 10) */
@@ -205,6 +210,7 @@ typedef struct {
     int enabled, control_port;
     long min_bitrate; /* kbit/s */
     long enc_min;     /* kbit/s: the encoder's own floor, the bitrate goes no lower */
+    long ladder_from; /* ALINK_LADDER_FROM: kbit/s, -1 = the preset's */
     int min_fps, thermal;
     int os_control;   /* ALINK_BITRATE_OVERSHOOT_CONTROL */
     int isp[ISP_N];   /* ALINK_ISP_DESPIKE / _SHARPNESS / _GRAYSCALE, -1 = leave alone */
@@ -222,6 +228,7 @@ static void conf_read(conf_t *c)
     c->control_port = 2226;
     c->min_bitrate = 1;
     c->enc_min = 1000;
+    c->ladder_from = -1;
     c->min_fps = 15;
     c->thermal = 1;
     c->os_max = 1.5;
@@ -241,6 +248,7 @@ static void conf_read(conf_t *c)
             if (sscanf(buf, "ALINK_ENABLED=%15s", on) == 1 && truthy(on) >= 0)
                 c->enabled = truthy(on);
             sscanf(buf, "ALINK_ENC_MIN=%ld", &c->enc_min);
+            sscanf(buf, "ALINK_LADDER_FROM=%ld", &c->ladder_from);
             sscanf(buf, "ALINK_MIN_FPS=%d", &c->min_fps);
             sscanf(buf, "ALINK_IFACE=%31s", c->iface);
             if (sscanf(buf, "ALINK_THERMAL=%15s", on) == 1 && truthy(on) >= 0)
@@ -786,6 +794,13 @@ static void fd_measure(alink_t *a, const conf_t *c, double t)
     }
 }
 
+/* kbit/s at or below which the ladder runs: the floor, or higher where the preset (ALINK_LADDER_FROM) says so */
+static long ladder_from(const alink_t *a, const conf_t *c)
+{
+    long floor = clamp(a, c, 0), lf = c->ladder_from >= 0 ? c->ladder_from : a->p->ladder_from;
+    return lf > floor ? lf : floor;
+}
+
 /* the frame rate of the floor's first stage: half the full rate (60 -> 30), not below ALINK_MIN_FPS */
 static int half_fps(const alink_t *a, const conf_t *c)
 {
@@ -799,9 +814,10 @@ static int degraded(const alink_t *a) { return a->fps_cap < a->fps_full || a->is
 /* with the bitrate at its floor (congested, or overshoot control): while the output is still above the target, the next
  * stage of the ladder: frame rate to half, then the ISP stage, then the frame rate lower (the step expected to fit,
  * not below ALINK_MIN_FPS) */
-static void floor_frames(alink_t *a, const conf_t *c, double t)
+static void floor_frames(alink_t *a, const conf_t *c, double t, int wait_bitrate)
 {
-    if (a->actual < 0 || t - a->fd_last_change < FD_WINDOW + FD_SETTLE || t - a->last_change < FD_WINDOW + FD_SETTLE)
+    if (a->actual < 0 || t - a->fd_last_change < FD_WINDOW + FD_SETTLE ||
+        (wait_bitrate && t - a->last_change < FD_WINDOW + FD_SETTLE))
         return; /* no measurement yet, or it still holds frames from before the last change */
     double r = a->actual / (a->current * 1.024); /* video0.bitrate is in units of 1024 bit/s */
     if (r < FD_OVER)
@@ -856,8 +872,10 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
             /* straight to where it should fit (clamped to the floor): one step, then the frame rate if needed */
             if (apply(a, c, (long)(a->current / r), "overshoot", NULL))
                 a->last_change = t;
+            if (a->current > clamp(a, c, 0) && a->current <= ladder_from(a, c))
+                floor_frames(a, c, t, 0); /* aggressive preset: the ladder already, alongside the cut */
         } else
-            floor_frames(a, c, t);
+            floor_frames(a, c, t, 1);
         return;
     }
     if (a->stats_ok) /* modem stats: the link decides when to go back up (control) */
@@ -1025,8 +1043,10 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
             if (apply(a, c, (long)target, "congestion", l))
                 a->last_change = t;
             else if (a->current <= clamp(a, c, 0))
-                floor_frames(a, c, t); /* the bitrate is at its floor: frames are next */
+                floor_frames(a, c, t, 1); /* the bitrate is at its floor: the ladder is next */
         }
+        if (cut && !grace && a->current > clamp(a, c, 0) && a->current <= ladder_from(a, c))
+            floor_frames(a, c, t, 0); /* aggressive preset: the ladder already, alongside the cuts */
     } else if (clear) {
         if (a->clear_since < 0)
             a->clear_since = t;

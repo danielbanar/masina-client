@@ -46,7 +46,8 @@ Keyframes only make short spikes that drain within the interval, so they don't c
   firing) = no raising; *handover* = no cuts for 1 s after the cell changes; *no service* = no raising.
 
 **2. Bitrate floor -> the ladder.** The bitrate never goes below `ALINK_ENC_MIN` (1000 kbit/s: waybeam does not
-encode below that). The encoder always gets the target; what it actually sends is normally not looked at. Only when
+encode below that; checked in the encoder driver, `/proc/mi_modules/mi_venc/mi_venc0`: targets of 900, 700, 500, 300
+and 100 all run at MaxBitrate 1024000). The encoder always gets the target; what it actually sends is normally not looked at. Only when
 the link is **congested and the bitrate is already at the floor**, modem_alink measures the real output and, while it
 is above the target, makes the picture cheaper one stage at a time (~1.3 s apart, each measured before the next):
 
@@ -63,7 +64,11 @@ at 60 fps even at the coarsest quantizer. Measured, dark scene at 1440p60 with o
 4000: 0 s bitrate 4000 -> 1000, 1.4 s 30 fps, 2.7 s ISP stage, 3.9 s 15 fps: output ~21 -> ~2 Mbit/s.
 
 **3. Recovery.** When the link is clear again, the same way back: frame rate up to 30, the ISP settings back, frame
-rate up to full, and only then the bitrate. One step every 3 s; a step up that has to be undone soon after doubles
+rate up to full, and only then the bitrate.
+
+The **performance** preset is more aggressive: its ladder already starts once the bitrate is at or below 2000 kbit/s,
+alongside the cuts (e.g. congested: 4000 -> 1860 kbit/s and 30 fps at once, where balanced goes 4000 -> 2280 at
+60 fps). `ALINK_LADDER_FROM=<kbit/s>` overrides it for any preset (0 = only at the floor). One step every 3 s; a step up that has to be undone soon after doubles
 the wait (up to 60 s), 20 s without a step down brings it back to 3 s, so it does not bounce.
 
 **Measuring the output.** From the transmit counters (`/sys/class/net/<if>/statistics/tx_bytes`, `tx_packets`) of
@@ -109,11 +114,11 @@ bitrate is held. Frame-rate changes use `/api/v1/live/set` (not written to flash
 
 ### Presets
 
-| Preset | Max bitrate | Cut per line (down_factor / cut_floor) | Aim when congested (ul_share, drain) | Raise after | Raise speed |
-|---|---|---|---|---|---|
-| `performance` | 4000 kbit/s | 0.70 / 0.25 | 70 % of uplink, 0.5 s | 3.0 s clear | ~3 %/s |
-| `balanced` (default) | 8000 kbit/s | 0.85 / 0.50 | 80 % of uplink, 1.0 s | 2.0 s clear | ~5 %/s |
-| `quality` | 16000 kbit/s | 0.90 / 0.50 | 90 % of uplink, 2.0 s | 1.0 s clear | ~8 %/s |
+| Preset | Max bitrate | Cut per line (down_factor / cut_floor) | Aim when congested (ul_share, drain) | Raise after | Raise speed | Ladder from |
+|---|---|---|---|---|---|---|
+| `performance` | 4000 kbit/s | 0.70 / 0.25 | 70 % of uplink, 0.5 s | 3.0 s clear | ~3 %/s | 2000 kbit/s |
+| `balanced` (default) | 8000 kbit/s | 0.85 / 0.50 | 80 % of uplink, 1.0 s | 2.0 s clear | ~5 %/s | the floor |
+| `quality` | 16000 kbit/s | 0.90 / 0.50 | 90 % of uplink, 2.0 s | 1.0 s clear | ~8 %/s | the floor |
 
 ### /etc/masina.conf
 
@@ -124,7 +129,8 @@ bitrate is held. Frame-rate changes use `/api/v1/live/set` (not written to flash
 | `ALINK_CAMERA` | `127.0.0.1:80` | waybeam HTTP API |
 | `ALINK_CONTROL_PORT` | `2226` | control port (HTTP and UDP) |
 | `ALINK_MIN_BITRATE` | `1` | kbit/s; the effective floor is the higher of this and `ALINK_ENC_MIN` |
-| `ALINK_ENC_MIN` | `1000` | kbit/s; the encoder's own floor, the bitrate goes no lower |
+| `ALINK_ENC_MIN` | `1000` | kbit/s; the encoder's own floor, the bitrate goes no lower (waybeam runs anything lower at 1000, so a lower value only adds cuts that change nothing) |
+| `ALINK_LADDER_FROM` | the preset's | kbit/s at or below which the ladder starts alongside the cuts (performance 2000, others the floor; 0 = only at the floor) |
 | `ALINK_MIN_FPS` | `15` | lowest frame rate the bitrate-floor logic uses |
 | `ALINK_IFACE` | `auto` | interface to measure the output on; `auto` = route to waybeam's `outgoing.server` |
 | `ALINK_BITRATE_OVERSHOOT_CONTROL` | `false` | watch the output all the time (see 4.) |
