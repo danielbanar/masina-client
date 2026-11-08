@@ -391,7 +391,7 @@ Source: PUCCH CSI reports (0xB14D), what the modem tells the tower about the dow
 
 ### Modem health
 
-Polled over AT every 5 s.
+Polled over AT every 5 s (the same poll reads the serving cell's bandwidth, `bw`).
 
 | Field | Unit | Meaning |
 |---|---|---|
@@ -405,7 +405,10 @@ Source: serving cell measurement (0xB193), about 50 samples a second, averaged.
 | Field | Unit | Meaning | How to read it |
 |---|---|---|---|
 | `earfcn` | | Downlink channel number of the serving cell. It gives the band: 1200–1949 = band 3 (1800 MHz), 3450–3799 = band 8 (900 MHz), 6150–6449 = band 20 (800 MHz). | Here: 1850 = band 3, 3500 = band 8, 6400 = band 20. |
+| `bw` | MHz | Channel bandwidth of the serving cell: 1.4, 3, 5, 10, 15 or 20 MHz. From the AT poll every 5 s (`AT+CPSI?` on SIMCom, `AT+QENG="servingcell"` on Quectel), kept per EARFCN: after moving to a frequency not seen before it is NA until the next poll (at most 5 s), and NA without an AT port. | Here band 3 = 20 MHz, band 8 and band 20 = 10 MHz. `dl_rbs` can reach 50 resource blocks on 10 MHz, 100 on 20 MHz. |
 | `pci` | | Physical cell ID (0–503) of the serving cell. | Same tower, different band = usually the same PCI (186 here). Neighbouring PCIs (187) are often other sectors. |
+| `cell_id` | | E-UTRAN cell identity of the serving cell (28 bits) = eNodeB × 256 + local cell. From the same AT poll as `bw`, kept per EARFCN + PCI: NA until the next poll (at most 5 s) on a cell not seen before, and NA without an AT port. | Unique per cell, unlike the PCI. |
+| `enb` | | `cell_id` ÷ 256: the eNodeB, i.e. the base station (tower site). | Here band 3 (cell 326000), band 8 (326030) and band 20 (325990) are all eNodeB 1273: one tower, local cells 112, 142 and 102. A change of `enb` means a different tower. |
 | `rsrp0` | dBm | Reference signal received power on RX antenna 0. | > −90 excellent, −90 to −105 good, −105 to −115 fair, −115 to −120 poor, < −120 cell edge. |
 | `rsrp1` | dBm | Same on RX antenna 1 (diversity). | `AT+CPSI?` shows the better of `rsrp0`/`rsrp1`. |
 | `rsrp_diff` | dB | `rsrp0 − rsrp1`. | More than ~6–10 dB = an antenna or cable problem, or a strongly orientation-dependent setup. |
@@ -470,8 +473,8 @@ Printed the moment they happen, with the exact time (milliseconds):
 SIM7600G-H;time=17:02:19.003;event=handover;from_pci=186;from_earfcn=1850;to_pci=186;to_earfcn=3500
 ```
 
-Except `cell_change`, they come from the RRC messages between modem and network (0xB0C0) and the random-access
-logs (0xB061/0xB062).
+Except `cell_change` and `nas`, they come from the RRC messages between modem and network (0xB0C0) and the
+random-access logs (0xB061/0xB062).
 
 ### rrc_setup
 
@@ -593,6 +596,30 @@ A random access on the uplink (how the modem gets in contact with a cell).
 `reestablishment_done` = it worked, data continues. `reestablishment_reject` = it didn't; the modem goes idle and
 must connect anew.
 
+### nas
+
+A message between the modem and the core network (NAS, 3GPP TS 24.301): registration (EMM) and data bearers (ESM).
+Source: 0xB0EC / 0xB0ED (EMM in / out) and 0xB0E2 / 0xB0E3 (ESM in / out), already deciphered by the modem.
+Format (example lines, not a recording):
+
+```
+SIM7600G-H;time=17:02:20.115;event=nas;dir=ul;msg=service_request
+SIM7600G-H;time=18:31:04.902;event=nas;dir=dl;msg=service_reject;cause=10:implicitly_detached
+```
+
+| Field | Meaning |
+|---|---|
+| `dir` | `ul` from the modem, `dl` from the network. |
+| `msg` | The message: `attach_request` / `_accept` / `_reject`, `detach_request` / `_accept`, `tau_request` / `_accept` / `_reject` (tracking area update), `service_request` / `_reject`, `authentication_*`, `security_mode_*`, `emm_information`, ESM `pdn_connectivity_*`, `activate_default_bearer_*`, `deactivate_bearer_*`, …; unknown types as `emm_0x..` / `esm_0x..`. |
+| `type` | `attach_request`: `eps` / `combined` / `emergency`. `tau_request`: `ta_updating` / `combined` / `combined_imsi_attach` / `periodic`. `detach_request` from the network: `reattach_required` / `reattach_not_required` / `imsi_detach`; from the modem: `eps` / `imsi` / `combined` plus `switch_off`. |
+| `cause` | On rejects, a network detach and ESM rejects / deactivation: `<number>:<name>`, e.g. `10:implicitly_detached`, `15:no_suitable_cells_in_ta`, `22:congestion`, `36:regular_deactivation`; causes without a name in `modem_link` print as `<number>:other`. |
+
+Normal operation: a `service_request` at every connection from idle (with `rrc_setup`), a periodic `tau_request` /
+`tau_accept` now and then, a `tau_request` when the tracking area changes. A reject, a detach from the network or an
+`attach_request` in the middle of a flight means the modem lost its registration: the data connection is gone until it
+is registered again. Not verified on a modem yet: the log codes and format are those other DIAG decoders use for the
+MDM9x07.
+
 ### cell_change
 
 Printed by `modem_link` itself when the serving cell (EARFCN/PCI) differs from the previous interval:
@@ -618,6 +645,7 @@ Printed once when `modem_link` stops: `<model>;event=summary;...`
 | `rlc_ul_retx`, `rlc_ul_nack`, `rlc_dl_retx`, `rlc_dl_nack`, `rlc_dl_drop`, `pdcp_ul_discard` | Totals of the RLC/PDCP counters. |
 | `t310_intervals` | Intervals where T310 ran. |
 | `rrc_setups`, `rrc_releases`, `meas_reports`, `handovers`, `handovers_done`, `reestablishments` | Event counts. |
+| `nas_rejects` | NAS attach / TAU / service rejects and detaches by the network: times the modem lost its registration. |
 | `temp_min`, `temp_max`, `vbat_min`, `vbat_max` | Range of the modem temperature and supply voltage. |
 
 ---
@@ -743,6 +771,7 @@ DIAG log packets `modem_link` subscribes to (SIM7600 / EC25 versions):
 | 0xB087, 0xB097, 0xB0B4 | RLC DL, RLC UL, PDCP UL statistics | RLC/PDCP counters |
 | 0xB0C0 | RRC OTA message | All events except `cell_change` and `rach` |
 | 0xB061, 0xB062 | RACH trigger / attempt | `rach` events |
+| 0xB0E2, 0xB0E3, 0xB0EC, 0xB0ED | NAS ESM / EMM plain OTA messages | `nas` events |
 
 ---
 

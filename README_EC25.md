@@ -6,6 +6,7 @@ LTE Cat 4 module with the same Qualcomm chipset family (MDM9x07) and the same DI
 - [Setup](#setup)
 - [Example output](#example-output)
 - [Measured on this setup](#measured-on-this-setup)
+- [Verified on this modem](#verified-on-this-modem)
 - [Known issues](#known-issues)
 - [Running it](#running-it)
 - [Line format](#line-format)
@@ -26,13 +27,13 @@ LTE Cat 4 module with the same Qualcomm chipset family (MDM9x07) and the same DI
 | Module | Quectel EC25-EU, firmware EC25EUXGAR08A16M1G |
 | Chipset | Qualcomm MDM9607 family: the same DIAG log versions as the SIM7600 |
 | LTE category | Cat 4: up to 150 Mbit/s down, 50 Mbit/s up |
-| Bands | EU variant. Seen here: band 20 (800 MHz) and band 8 (900 MHz). |
+| Bands | EU variant: LTE bands 1, 3, 7, 8, 20, 28, 38, 40, 41 enabled (`AT+QCFG="band"` = `0x1a0080800c5`). Seen here: band 20 (800 MHz) and band 8 (900 MHz), both 10 MHz wide. |
 | Carrier aggregation | No |
-| MIMO | 2×2 downlink (rank 2 most of the time at −99 dBm) |
+| MIMO | 2×2 downlink (rank 2 most of the time at −99 dBm on 22 Oct; on 25 Oct the second antenna read ~9 dB weaker and the modem stayed at rank 1, see [Known issues](#known-issues)) |
 | Uplink | QPSK and 16QAM. 23 dBm class; measured at most ~21 dBm with 38 resource blocks of 16QAM (the standard power reduction for wide allocations) |
 | USB | `2c7c:0125`. Network mode with `AT+QCFG="usbnet"`: 0 QMI, 1 ECM, 2 MBIM, 3 RNDIS. Ran in RNDIS here: the modem routes, DHCP gives 192.168.225.x |
 | Serial ports | `ttyUSB0` DIAG, `ttyUSB1` GPS (NMEA), `ttyUSB2` AT, `ttyUSB3` AT / PPP |
-| Useful AT commands | `AT+QENG="servingcell"`, `AT+QTEMP` (three sensors; `modem_link` shows the hottest), `AT+CBC`, `AT+QCFG="usbnet"`, `AT+QGDCNT` (data counter), `AT+QLTS` (network time) |
+| Useful AT commands | `AT+QENG="servingcell"` (RSRP, RSRQ, RSSI, SINR in dB; RSRP is the better antenna), `AT+QTEMP` (three sensors; `modem_link` shows the hottest), `AT+CBC`, `AT+QCFG="usbnet"`, `AT+QGDCNT` (data counter), `AT+QLTS` (network time) |
 | What `modem_link` decodes | Everything, as on the SIM7600 (the extra MAC/RLC/PDCP fields were first verified on the EC25) |
 | DIAG log versions | serving cell v18, PDSCH v5, PUSCH v25, PHICH v5, power control v5, CSI v24, UL buffer v5, MAC UL TB v1, RRC v20 |
 
@@ -40,7 +41,8 @@ LTE Cat 4 module with the same Qualcomm chipset family (MDM9x07) and the same DI
 
 ## Setup
 
-- **ModemManager** takes the EC25's AT ports unless the modem is excluded with a udev rule (like the SIM7600's):
+- **ModemManager** takes the EC25's AT ports unless the modem is excluded with a udev rule (like the SIM7600's;
+  on this PC it is `/etc/udev/rules.d/79-ec25.rules` since 25 Oct, then `systemctl restart ModemManager`):
   `ACTION=="add|change", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0125", ENV{ID_MM_DEVICE_IGNORE}="1"`.
   Without it the DIAG port still works, but temperature and voltage are NA and the model name comes from the
   DIAG build ID (`EC25EUXGAR08A16M1G` → `EC25`).
@@ -112,13 +114,44 @@ From the tests on 22 Oct 2026 (O2 Slovakia, band 20/8):
 | Throughput limit | The delivered rate stopped at about 19.6 Mbit/s up and 20.5 Mbit/s down whatever the radio quality: a network limit (most likely the subscription's maximum bit rate). The network queued first (round trip up to 2.5 s), then dropped. |
 | Band 20, RSRP ~−99 dBm | 17–18 Mbit/s up with a standing queue, power-limited at ~21 dBm; 17–25 Mbit/s down at rank 2. |
 | Radio-limited uplink | The modem's buffer (`ul_buf`) filled to ~300 KB, then the modem dropped packets. A buffer above 100–150 KB gave a median of ~3 s warning before loss: the best loss predictor found (correlation ~0.8). HARQ, BLER and CQI did not predict loss. |
-| Network rules | In the capture above: a periodic A5 check for band 3 (1850) with gaps, on cell 186 (band 20). |
+| Network rules | In the capture above: a periodic A5 check for band 3 (1850) with gaps, on cell 186 (band 20). On 25 Oct: the same load-balancing A5 (`serving<rsrp-44dBm&nb>rsrp-112dBm`, 640 ms) every 4.5 min, alternating band 3, 8 and 20; once band 8 was above −112 dBm, the modem went 20 → 8 (19 ms) and a minute later back 8 → 20 (20 ms). |
+| Uplink, 25 Oct | Band 20 at −100 dBm: 20 Mbit/s offered was carried in full (19.9–20.2 Mbit/s, 37–39 RBs 16QAM, ~19.5 dBm, not power-limited), with a queue of 26–159 KB in the first burst and up to 50 KB in the second. |
+
+---
+
+## Verified on this modem
+
+On 25 Oct 2026 (17:49–18:10) `modem_link` at commit c4e313a ran live for 20 minutes on a raw DIAG recording, next
+to values that don't come from DIAG: `AT+QENG="servingcell"`, `AT+QTEMP` and `AT+CBC` every 3 s on the second AT
+port, and the PC's byte counters of the RNDIS interface every second. Load: four 5-minute cycles of 1 / 4 / 20 Mbit/s
+UDP upload and a 3 MB download, a ping every second in between.
+
+| What | Compared with | Result |
+|---|---|---|
+| DIAG log versions | Raw recording | As listed above, identical to the SIM7600 (0xB195: subpackets 30 v3 and 31 v4). |
+| Line cadence | Line times | 1223 lines in 1222 s, one per second. |
+| `ul_rate` | Bytes the PC sent | 0.97–0.98 of the PC's IP rate at 1, 4 and 20 Mbit/s in every cycle (20 Mbit/s: 20.2 and 19.9 Mbit/s); no 5-s pattern. Summary `ul_total` 51.5 vs 53.1 MB. |
+| `dl_rate`, `dl_total` | Bytes the PC received | Downlink total 107 vs 105 Mbit, summary `dl_total` 13.6 vs 13.1 MB. |
+| Queue fields | Each other | `qdelay` = `ul_buf` ÷ `ul_rate` on every line, `qwarn` as defined, `ul_buf_min` ≤ `ul_buf` ≤ `ul_buf_max`; largest `ul_buf_max` 159 KB (no ~4 GB samples). |
+| `earfcn`, `pci` | `AT+QENG` | Equal in all 407 samples, including both handovers. |
+| `rsrp0`/`rsrp1`, `rsrq`, `rssi` | `AT+QENG` | QENG's RSRP is the better antenna: median −0.6 dB (p10 −0.8, p90 0.0). RSRQ −0.5 dB, RSSI 0.0 dB median (QENG is a snapshot, `modem_link` an average). |
+| `snr0`/`snr1` | `AT+QENG` SINR | Median +0.2 dB: on the EC25 they agree (the SIM7600's `AT+CPSI?` reads 3–5 dB higher). |
+| `temp`, `vbat` | `AT+QTEMP` (hottest of 3), `AT+CBC` (mV) | Equal; supply 3.68–3.69 V. |
+| Events | Timing, each other | Two handovers (20 → 8, 8 → 20): report, `handover`, `handover_done` (19 / 20 ms), `rach` (`ta=17` = 1328 m), `cell_change` consistent; summary counts equal the events. |
+| Ranges | Plausibility | Every field within its range; `ul_txpwr`/`pathloss` NA on ~12 % of lines (0xB16E comes in batches), `cqi1` NA at rank 1. |
 
 ---
 
 ## Known issues
 
 - **AT ports** need the udev rule above, or temperature, voltage and the AT model name are NA.
+- **No neighbours on other bands**, as on the SIM7600 (same logs): `nb_*` / `ho_margin` only show cells on the
+  serving band, and for an A5 rule on another band `trigger_nb=NA`, `trigger_gap=0.0dB`, `trigger_held=0ms` right
+  up to the handover; the cell the modem found is only in the `meas_report` event.
+- **Second antenna weak on 25 Oct.** `rsrp1` was a median 9.3 dB below `rsrp0` (5–12 dB), so the modem asked for
+  rank 1 on 85 % of the lines and downloaded without MIMO (`dl_mimo` 0 %). On 22 Oct both antennas were within
+  ~2–3 dB. Check the diversity antenna and its cable.
+- **The last line at Ctrl-C** is the interrupted interval: same time as the line before, mostly NA. Ignore it.
 - **One garbage queue sample of ~4 GB** could appear during a band search in older builds (same decoder as the
   SIM7600); negative buffer samples are now dropped. Every fifth line was also ~20 % high because of the AT polls,
   fixed too (see the SIM7600 readme).
@@ -187,7 +220,7 @@ In output order. "Source" names the DIAG log packet ([table](#where-the-values-c
 
 | Field | Meaning |
 |---|---|
-| `time` | Local time (HH:MM:SS) at the end of the interval. |
+| `time` | Local time (HH:MM:SS, cut to the whole second) at the end of the interval; intervals follow each other without gaps, so at 1 s every second appears once. |
 
 ### Downlink (tower → modem)
 
@@ -218,10 +251,10 @@ out.
 | `ul_nack_pct` | % | | NACKs as a share of all PHICH answers. | |
 | `ul_rate` | Mbps | MAC UL TB (0xB064) | Uplink goodput at the MAC layer: bytes of new transport blocks minus padding. **This is what the uplink actually carried.** | `modem_alink` uses it as the link's capacity while a queue is waiting. |
 | `ul_grant` | Mbps | MAC UL Tx stats (0xB067) | Uplink capacity the tower granted. | Grant ≫ `ul_rate` = the modem had less to send than it was offered. |
-| `ul_grant_used` | % | | Share of granted bytes filled with data (the rest is padding). | ~100 % with a queue waiting = the grant is the bottleneck. |
+| `ul_grant_used` | % | | Share of granted bytes filled with data (the rest is padding). | The network sizes grants to the modem's buffer reports, so it reads ~100 % with any steady stream of a few Mbit/s even without a queue. Only together with `qdelay_min` > 0 does it mean the grant is the bottleneck. |
 | `ul_rbs` | | PUSCH tx | Mean resource blocks per uplink transmission. | |
 | `ul_mod` | | PUSCH tx | Most used uplink modulation in the interval: `QPSK`, `16QAM`, `64QAM`. | The EC25 tops out at 16QAM. |
-| `ul_coderate` | | PUSCH tx | Mean coding rate (0–1). | Higher = more data per resource block. |
+| `ul_coderate` | | PUSCH tx | Mean coding rate as the modem logs it (about 0–1). | Higher = more data per resource block. |
 
 ### Uplink power
 
@@ -279,7 +312,7 @@ Source: PUCCH CSI reports (0xB14D), what the modem tells the tower about the dow
 
 ### Modem health
 
-Polled over AT every 5 s.
+Polled over AT every 5 s (the same poll reads the serving cell's bandwidth, `bw`).
 
 | Field | Unit | Meaning |
 |---|---|---|
@@ -293,7 +326,10 @@ Source: serving cell measurement (0xB193), about 50 samples a second, averaged.
 | Field | Unit | Meaning | How to read it |
 |---|---|---|---|
 | `earfcn` | | Downlink channel number of the serving cell. It gives the band: 1200–1949 = band 3 (1800 MHz), 3450–3799 = band 8 (900 MHz), 6150–6449 = band 20 (800 MHz). | Here: 1850 = band 3, 3500 = band 8, 6400 = band 20. |
+| `bw` | MHz | Channel bandwidth of the serving cell: 1.4, 3, 5, 10, 15 or 20 MHz. From the AT poll every 5 s (`AT+CPSI?` on SIMCom, `AT+QENG="servingcell"` on Quectel), kept per EARFCN: after moving to a frequency not seen before it is NA until the next poll (at most 5 s), and NA without an AT port. | Here band 3 = 20 MHz, band 8 and band 20 = 10 MHz. `dl_rbs` can reach 50 resource blocks on 10 MHz, 100 on 20 MHz. |
 | `pci` | | Physical cell ID (0–503) of the serving cell. | Same tower, different band = usually the same PCI (186 here). Neighbouring PCIs (187) are often other sectors. |
+| `cell_id` | | E-UTRAN cell identity of the serving cell (28 bits) = eNodeB × 256 + local cell. From the same AT poll as `bw`, kept per EARFCN + PCI: NA until the next poll (at most 5 s) on a cell not seen before, and NA without an AT port. | Unique per cell, unlike the PCI. |
+| `enb` | | `cell_id` ÷ 256: the eNodeB, i.e. the base station (tower site). | Here band 3 (cell 326000), band 8 (326030) and band 20 (325990) are all eNodeB 1273: one tower, local cells 112, 142 and 102. A change of `enb` means a different tower. |
 | `rsrp0` | dBm | Reference signal received power on RX antenna 0. | > −90 excellent, −90 to −105 good, −105 to −115 fair, −115 to −120 poor, < −120 cell edge. |
 | `rsrp1` | dBm | Same on RX antenna 1 (diversity). | |
 | `rsrp_diff` | dB | `rsrp0 − rsrp1`. | More than ~6–10 dB = an antenna or cable problem, or a strongly orientation-dependent setup. |
@@ -303,8 +339,9 @@ Source: serving cell measurement (0xB193), about 50 samples a second, averaged.
 
 ### Neighbour cells
 
-Source: intra-frequency (0xB179) and all-frequency (0xB195) neighbour measurements. Cells on other bands are only
-measured while the network has measurement gaps on, i.e. while it is searching.
+Source: intra-frequency (0xB179) and connected-mode (0xB195) neighbour measurements. On the EC25 (as on the
+SIM7600) both contain only cells on the serving band, also during a search: cells measured on other bands appear
+only in `meas_report` (see [Known issues](#known-issues)).
 
 | Field | Unit | Meaning | How to read it |
 |---|---|---|---|
@@ -357,8 +394,8 @@ Printed the moment they happen, with the exact time (milliseconds); for example 
 SIM7600G-H;time=17:02:19.003;event=handover;from_pci=186;from_earfcn=1850;to_pci=186;to_earfcn=3500
 ```
 
-Except `cell_change`, they come from the RRC messages between modem and network (0xB0C0) and the random-access
-logs (0xB061/0xB062).
+Except `cell_change` and `nas`, they come from the RRC messages between modem and network (0xB0C0) and the
+random-access logs (0xB061/0xB062).
 
 ### rrc_setup
 
@@ -480,6 +517,30 @@ A random access on the uplink (how the modem gets in contact with a cell).
 `reestablishment_done` = it worked, data continues. `reestablishment_reject` = it didn't; the modem goes idle and
 must connect anew.
 
+### nas
+
+A message between the modem and the core network (NAS, 3GPP TS 24.301): registration (EMM) and data bearers (ESM).
+Source: 0xB0EC / 0xB0ED (EMM in / out) and 0xB0E2 / 0xB0E3 (ESM in / out), already deciphered by the modem.
+Format (example lines, not a recording):
+
+```
+SIM7600G-H;time=17:02:20.115;event=nas;dir=ul;msg=service_request
+SIM7600G-H;time=18:31:04.902;event=nas;dir=dl;msg=service_reject;cause=10:implicitly_detached
+```
+
+| Field | Meaning |
+|---|---|
+| `dir` | `ul` from the modem, `dl` from the network. |
+| `msg` | The message: `attach_request` / `_accept` / `_reject`, `detach_request` / `_accept`, `tau_request` / `_accept` / `_reject` (tracking area update), `service_request` / `_reject`, `authentication_*`, `security_mode_*`, `emm_information`, ESM `pdn_connectivity_*`, `activate_default_bearer_*`, `deactivate_bearer_*`, …; unknown types as `emm_0x..` / `esm_0x..`. |
+| `type` | `attach_request`: `eps` / `combined` / `emergency`. `tau_request`: `ta_updating` / `combined` / `combined_imsi_attach` / `periodic`. `detach_request` from the network: `reattach_required` / `reattach_not_required` / `imsi_detach`; from the modem: `eps` / `imsi` / `combined` plus `switch_off`. |
+| `cause` | On rejects, a network detach and ESM rejects / deactivation: `<number>:<name>`, e.g. `10:implicitly_detached`, `15:no_suitable_cells_in_ta`, `22:congestion`, `36:regular_deactivation`; causes without a name in `modem_link` print as `<number>:other`. |
+
+Normal operation: a `service_request` at every connection from idle (with `rrc_setup`), a periodic `tau_request` /
+`tau_accept` now and then, a `tau_request` when the tracking area changes. A reject, a detach from the network or an
+`attach_request` in the middle of a flight means the modem lost its registration: the data connection is gone until it
+is registered again. Not verified on a modem yet: the log codes and format are those other DIAG decoders use for the
+MDM9x07.
+
 ### cell_change
 
 Printed by `modem_link` itself when the serving cell (EARFCN/PCI) differs from the previous interval:
@@ -505,6 +566,7 @@ Printed once when `modem_link` stops: `<model>;event=summary;...`
 | `rlc_ul_retx`, `rlc_ul_nack`, `rlc_dl_retx`, `rlc_dl_nack`, `rlc_dl_drop`, `pdcp_ul_discard` | Totals of the RLC/PDCP counters. |
 | `t310_intervals` | Intervals where T310 ran. |
 | `rrc_setups`, `rrc_releases`, `meas_reports`, `handovers`, `handovers_done`, `reestablishments` | Event counts. |
+| `nas_rejects` | NAS attach / TAU / service rejects and detaches by the network: times the modem lost its registration. |
 | `temp_min`, `temp_max`, `vbat_min`, `vbat_max` | Range of the modem temperature and supply voltage. |
 
 ---
@@ -630,6 +692,7 @@ DIAG log packets `modem_link` subscribes to (SIM7600 / EC25 versions):
 | 0xB087, 0xB097, 0xB0B4 | RLC DL, RLC UL, PDCP UL statistics | RLC/PDCP counters |
 | 0xB0C0 | RRC OTA message | All events except `cell_change` and `rach` |
 | 0xB061, 0xB062 | RACH trigger / attempt | `rach` events |
+| 0xB0E2, 0xB0E3, 0xB0EC, 0xB0ED | NAS ESM / EMM plain OTA messages | `nas` events |
 
 ---
 

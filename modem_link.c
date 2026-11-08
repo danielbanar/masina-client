@@ -65,8 +65,9 @@ static const char *HEADER =
     "    tx HARQretx       Mbit   RBs   mod  rate  pwr  pwr>23 |  NACK%  grant Mbit used%  txpwr  PL  f(i) |"
     " buf KB qdly ms qmax PHR | CQI0/1    RI  | degC  V  | EARFCN PCI  RSRP0/1 dBm  diff   SNR0/1 dB    RSRQ  RSSI | nbPCI  RSRP  margin | trigger             gap";
 
-/* modem temperature and supply voltage over AT, polled every HEALTH_PERIOD s */
+/* modem temperature, supply voltage and the serving cell's bandwidth and cell ID over AT, polled every HEALTH_PERIOD s */
 #define HEALTH_PERIOD 5
+#define AT_CELLS 8
 typedef struct {
     int fd;
     double last;
@@ -75,6 +76,10 @@ typedef struct {
     double volt, vmin, vmax;
     char model[64];
     int quectel;
+    /* cells as AT last reported them: the line shows the values of the cell DIAG sees (bandwidth by EARFCN, cell ID by
+     * EARFCN + PCI), so right after a handover they are NA until the next poll, never the old cell's */
+    struct { unsigned earfcn; int pci; double mhz; long cell_id; } cell[AT_CELLS];
+    int ncell;
 } health_t;
 
 static void health_open(health_t *h, const char *port, diag_t *d)
@@ -242,6 +247,60 @@ static void kv_end(void)
     }
 }
 
+/* serving cell report: SIMCom AT+CPSI? "LTE,Online,231-06,0xA53E,326000,186,EUTRAN-BAND3,1850,5,5,..." (TAC, cell ID
+ * in decimal, PCI, band, EARFCN, DL / UL bandwidth), Quectel AT+QENG="servingcell" "\"servingcell\",\"NOCONN\",\"LTE\",
+ * \"FDD\",231,06,4F966,186,6400,20,3,3,A53E,..." (cell ID in hex, PCI, EARFCN, band, UL / DL bandwidth, TAC).
+ * The bandwidth is an index: 0..5 = 1.4, 3, 5, 10, 15, 20 MHz. The cell ID is the 28-bit E-UTRAN cell identity:
+ * eNodeB (the base station) * 256 + local cell. Returns 1 if the report had an LTE serving cell. */
+static int parse_cell(const char *v, int quectel, unsigned *earfcn, int *pci, double *mhz, long *cell_id)
+{
+    static const double MHZ[] = { 1.4, 3, 5, 10, 15, 20 };
+    char f[24][24];
+    int n = 0;
+    for (const char *p = v; *p && n < 24; n++) {
+        const char *e = strchr(p, ',');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        snprintf(f[n], sizeof(f[n]), "%.*s", (int)(l < 23 ? l : 23), p);
+        if (!e) { n++; break; }
+        p = e + 1;
+    }
+    int ie = -1, ib = -1, ip = -1, ic = -1, hex = quectel;
+    if (quectel) {
+        if (n > 11 && !strcmp(f[2], "\"LTE\"")) { ic = 6; ip = 7; ie = 8; ib = 11; }
+    } else {
+        for (int i = 2; i + 2 < n; i++)
+            if (!strncmp(f[i], "EUTRAN-BAND", 11)) { ic = i - 2; ip = i - 1; ie = i + 1; ib = i + 2; break; }
+    }
+    if (ie < 0) return 0;
+    int b = atoi(f[ib]);
+    if (b < 0 || b > 5 || !isdigit((unsigned char)f[ie][0]) || !isdigit((unsigned char)f[ib][0]) ||
+        !isdigit((unsigned char)f[ip][0]))
+        return 0;
+    char *end;
+    long c = strtol(f[ic], &end, hex ? 16 : 10);
+    *earfcn = (unsigned)strtoul(f[ie], NULL, 10);
+    *pci = atoi(f[ip]);
+    *mhz = MHZ[b];
+    *cell_id = (end != f[ic] && !*end && c >= 0 && c < (1L << 28)) ? c : -1;
+    return 1;
+}
+
+/* bandwidth AT reported for this EARFCN, 0 if none yet */
+static double cell_bw(const health_t *h, unsigned earfcn)
+{
+    for (int i = 0; i < h->ncell; i++)
+        if (h->cell[i].earfcn == earfcn) return h->cell[i].mhz;
+    return 0;
+}
+
+/* cell ID AT reported for this EARFCN + PCI, -1 if none yet */
+static long cell_id(const health_t *h, unsigned earfcn, int pci)
+{
+    for (int i = 0; i < h->ncell; i++)
+        if (h->cell[i].earfcn == earfcn && h->cell[i].pci == pci) return h->cell[i].cell_id;
+    return -1;
+}
+
 static void health_poll(health_t *h)
 {
     if (h->fd < 0 || now() - h->last < HEALTH_PERIOD)
@@ -265,6 +324,23 @@ static void health_poll(health_t *h)
     }
     if (!ht) h->have_t = 0;
     if (!hv) h->have_v = 0;
+    unsigned e;
+    int pci;
+    double mhz;
+    long id;
+    if ((h->quectel ? at_val(h->fd, "AT+QENG=\"servingcell\"", "+QENG", v, sizeof(v))
+                    : at_val(h->fd, "AT+CPSI?", "+CPSI", v, sizeof(v))) && parse_cell(v, h->quectel, &e, &pci, &mhz, &id)) {
+        int i = 0;
+        while (i < h->ncell && !(h->cell[i].earfcn == e && h->cell[i].pci == pci)) i++;
+        if (i == h->ncell) {
+            if (h->ncell < AT_CELLS) h->ncell++;
+            else i = 0; /* full: reuse the first slot */
+        }
+        h->cell[i].earfcn = e;
+        h->cell[i].pci = pci;
+        h->cell[i].mhz = mhz;
+        h->cell[i].cell_id = id;
+    }
 }
 
 static char *pct(char *o, double a, double b)
@@ -339,7 +415,8 @@ int main(int argc, char **argv)
     int codes[] = { LOG_PDSCH & 0xfff, LOG_PUSCH & 0xfff, LOG_MAC_UL & 0xfff, LOG_CSI & 0xfff, LOG_MEAS & 0xfff,
                     LOG_UL_BUF & 0xfff, LOG_UL_TXST & 0xfff, LOG_PHICH & 0xfff, LOG_PUSCH_PC & 0xfff, LOG_RLC_DL & 0xfff,
                     LOG_RLC_UL & 0xfff, LOG_PDCP_UL & 0xfff, LOG_NCELL & 0xfff, LOG_RLM & 0xfff, LOG_CONN_NB & 0xfff,
-                    LOG_RRC_OTA & 0xfff, LOG_RACH_TRIG & 0xfff, LOG_RACH_ATT & 0xfff };
+                    LOG_RRC_OTA & 0xfff, LOG_RACH_TRIG & 0xfff, LOG_RACH_ATT & 0xfff, LOG_NAS_ESM_IN & 0xfff,
+                    LOG_NAS_ESM_OUT & 0xfff, LOG_NAS_EMM_IN & 0xfff, LOG_NAS_EMM_OUT & 0xfff };
     int ok = -1;
     for (int i = 0; i < 3 && ok < 0; i++)
         ok = diag_set_log_mask(&d, 0xB, codes, sizeof(codes) / sizeof(codes[0]));
@@ -390,6 +467,8 @@ int main(int argc, char **argv)
             if (code == LOG_RRC_OTA) mob_rrc(&mob, mts, body, len);
             else if (code == LOG_RACH_TRIG) mob_rach_trig(&mob, body, len);
             else if (code == LOG_RACH_ATT) mob_rach_att(&mob, mts, body, len);
+            else if (code == LOG_NAS_EMM_IN || code == LOG_NAS_ESM_IN) mob_nas(&mob, mts, body, len, 1);
+            else if (code == LOG_NAS_EMM_OUT || code == LOG_NAS_ESM_OUT) mob_nas(&mob, mts, body, len, 0);
             if (mob.nev) print_events(&mob, hl.model, table, toff);
         }
         double t1 = now(), el = t1 - t0;
@@ -494,7 +573,12 @@ int main(int argc, char **argv)
             kv_f("temp", hl.have_t, hl.temp, 0, "C");
             kv_f("vbat", hl.have_v, hl.volt, 2, "V");
             kv_f("earfcn", s.rf_valid, s.earfcn, 0, "");
+            double bw = s.rf_valid ? cell_bw(&hl, s.earfcn) : 0;
+            kv_f("bw", bw > 0, bw, bw < 2 ? 1 : 0, "MHz");
             kv_f("pci", s.rf_valid, s.pci, 0, "");
+            long cid = s.rf_valid ? cell_id(&hl, s.earfcn, s.pci) : -1;
+            kv_f("cell_id", cid >= 0, cid, 0, "");
+            kv_f("enb", cid >= 0, cid >> 8, 0, "");
             kv_f("rsrp0", s.rf_valid, s.rsrp0, 1, "dBm");
             kv_f("rsrp1", s.rf_valid, s.rsrp1, 1, "dBm");
             kv_f("rsrp_diff", s.rf_valid, s.rsrp0 - s.rsrp1, 1, "dB");
@@ -607,6 +691,7 @@ int main(int argc, char **argv)
         kv_l("handovers", mob.counts[MOB_HO]);
         kv_l("handovers_done", mob.counts[MOB_HO_DONE]);
         kv_l("reestablishments", mob.counts[MOB_REEST]);
+        kv_l("nas_rejects", mob.counts[MOB_NAS_REJ]);
         kv_f("temp_min", seen_t, tmin, 0, "C");
         kv_f("temp_max", seen_t, tmax, 0, "C");
         kv_f("vbat_min", seen_v, vmin, 2, "V");
