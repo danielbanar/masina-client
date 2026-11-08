@@ -57,18 +57,18 @@ is above the target, lowers the frame rate to the step expected to fit:
 A detailed, moving scene can need far more than 1000 kbit/s at 60 fps even at the coarsest quantizer (measured at
 2816x1584: full-screen noise ~11 Mbit/s at a 1000 target, ~4 Mbit/s at 15 fps).
 
-**3. Recovery.** When the link is clear again: **frame rate first** (one step every ~3 s), and only once it is back
+**3. Recovery.** When the link is clear again: **frame rate first** (one step every ~3 s; going down takes ~1.3 s per step), and only once it is back
 to full, the bitrate.
 
 **Measuring the output.** From the transmit counters (`/sys/class/net/<if>/statistics/tx_bytes`, `tx_packets`) of
-the interface the stream leaves on, minus IP/UDP/RTP headers per packet, averaged over 2 s. The interface is found
+the interface the stream leaves on, minus IP/UDP/RTP headers per packet, averaged over 1 s. The interface is found
 from waybeam's `outgoing.server` and the routing table (`wg0` in flight, `eth0` on the bench), or set with
 `ALINK_IFACE`. Matches what the ground receives within ~3 %. Note: waybeam's `video0.bitrate` is in units of
 1024 bit/s.
 
 **4. Optional: bitrate overshoot control** (`ALINK_BITRATE_OVERSHOOT_CONTROL`, off by default). Watches the output
 all the time, congested or not: at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5) it lowers the
-bitrate (by the overshoot, at most the preset's `cut_floor` per step), and at the floor the frame rate. Without
+bitrate (by the overshoot, in one step, not below the floor), and at the floor the frame rate (~1.3 s later). Without
 modem stats it also recovers on its own: below 0.8 x the max for `up_after` s, frame rate first, then the bitrate in
 10 % steps back to the bitrate that was set (never above it). With modem stats the link decides when to go back up,
 but not while the output is still near the max.
@@ -165,7 +165,7 @@ ALINK;time=00:51:46;enabled=1;preset=balanced;bitrate=3000kbps;max=8000kbps;fps=
 | `bitrate` | target given to the encoder |
 | `max` | preset's max |
 | `fps` | frame rate the camera runs |
-| `actual` | measured output, kbit/s over 2 s (once the interface is known) |
+| `actual` | measured output, kbit/s over 1 s (once the interface is known) |
 | `fps_cap` | frame rate allowed by the bitrate-floor / overshoot logic |
 | `temp`, `therm_fps` | SoC temperature and the thermal frame-rate cap (0 = none) |
 | `overshoot_control`, `overshoot_max` | current overshoot-control settings |

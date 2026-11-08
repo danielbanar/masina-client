@@ -41,7 +41,7 @@
  * (60 40 30 20 15 ..., not below ALINK_MIN_FPS): a detailed scene can need more than the floor at the full frame rate.
  * Recovering, the frame rate goes back up first, a step at a time, and only then the bitrate.
  * ALINK_BITRATE_OVERSHOOT_CONTROL=true also watches the output all the time: at or above ALINK_BITRATE_OVERSHOOT_MAX
- * times the target (default 1.5) the bitrate goes down (by the overshoot, at most the preset's cut_floor per step),
+ * times the target (default 1.5) the bitrate goes down (by the overshoot, in one step, not below the floor),
  * and at the floor the frame rate, whether the link is congested or not. Without modem stats the way back is its own:
  * below OS_BACK of the max for up_after s, frame rate first, then the bitrate in OS_UP steps back to the one that
  * was set (not above it).
@@ -109,8 +109,9 @@
 #define EDGE_GAP 2.0      /* dB: a network rule this close to firing (search, handover, release): no raising */
 #define HO_GRACE 1.0      /* s after a cell change without cuts: the queue the switch built drains on the new cell */
 #define FD_SAMPLE 0.25    /* s between transmit-counter samples */
-#define FD_WINDOW 2.0     /* s the output is averaged over (covers a keyframe) */
-#define FD_SETTLE 0.75    /* s after a frame-rate change before a window counts, on top of FD_WINDOW */
+#define FD_WINDOW 1.0     /* s the output is averaged over (a 1 s GOP's keyframe) */
+#define FD_SETTLE 0.25    /* s after a change before a window counts, on top of FD_WINDOW: going down is fast ... */
+#define FD_UP_GAP 3.0     /* ... going back up slow: s between steps up, so it does not bounce */
 #define FD_OVER 1.05      /* at the floor, output above this share of the target means frames have to go */
 #define FD_AIM 0.90       /* drop to the step expected to give this share of the target */
 #define FD_HDR 40         /* bytes per packet that are not video: IPv4 20 + UDP 8 + RTP 12 (+14 on Ethernet) */
@@ -810,10 +811,8 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
     if (r >= a->os_max) {
         a->os_ok_since = -1;
         if (a->current > clamp(a, c, 0)) {
-            double k = 1 / r; /* the overshoot says how far, at most the preset's biggest cut per step */
-            if (k < a->p->cut_floor)
-                k = a->p->cut_floor;
-            if (apply(a, c, (long)(a->current * k), "overshoot", NULL))
+            /* straight to where it should fit (clamped to the floor): one step, then the frame rate if needed */
+            if (apply(a, c, (long)(a->current / r), "overshoot", NULL))
                 a->last_change = t;
         } else
             floor_frames(a, c, t);
@@ -827,7 +826,7 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
     }
     if (a->os_ok_since < 0)
         a->os_ok_since = t;
-    if (t - a->os_ok_since < a->p->up_after)
+    if (t - a->os_ok_since < a->p->up_after || t - a->fd_last_change < FD_UP_GAP || t - a->last_change < FD_UP_GAP)
         return;
     if (a->fps_cap < a->fps_full) {
         frames_up(a, c, t); /* frames first */
@@ -980,7 +979,7 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
         if (a->clear_since < 0)
             a->clear_since = t;
         if (!hold_up && a->fps_cap < a->fps_full && t - a->clear_since >= p->up_after) {
-            if (t - a->fd_last_change >= FD_WINDOW + FD_SETTLE)
+            if (t - a->fd_last_change >= FD_UP_GAP)
                 frames_up(a, c, t); /* frames first, the bitrate once they are all back */
         } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP &&
                    !(a->os_control && a->actual >= 0 && a->actual >= a->current * 1.024 * a->os_max * OS_BACK)) {
