@@ -51,8 +51,9 @@
  * ALINK_BITRATE_OVERSHOOT_CONTROL=true also watches the output all the time: at or above ALINK_BITRATE_OVERSHOOT_MAX
  * times the target (default 1.5) the bitrate goes down (by the overshoot, in one step, not below the floor),
  * and at the floor the frame rate, whether the link is congested or not. Without modem stats the way back is its own:
- * below OS_BACK of the max for up_after s, frame rate first, then the bitrate in OS_UP steps back to the one that
- * was set (not above it).
+ * below OS_BACK of the max for up_after s, the ladder's stages first (just after one, an output above the target but
+ * not above the set bitrate raises the target to it instead of undoing the stage), then the bitrate in one step back
+ * to the one that was set (a higher target cannot overshoot, and there is no link to probe).
  *
  * Thermal: the SoC temperature (/sys/devices/virtual/mstar/msys/TEMP_R) caps the frame rate by /etc/temp_profile.conf
  * ("<min>-<max> <fps|-> <scale of the full rate|-> <update s>", first matching line), back up THERM_HYST degrees below
@@ -126,8 +127,7 @@
 #define FD_OVER 1.05      /* at the floor, output above this share of the target means frames have to go */
 #define FD_AIM 0.90       /* drop to the step expected to give this share of the target */
 #define FD_HDR 40         /* bytes per packet that are not video: IPv4 20 + UDP 8 + RTP 12 (+14 on Ethernet) */
-#define OS_BACK 0.8       /* overshoot control: back up once the output is below this share of the max ... */
-#define OS_UP 0.10        /* ... raising the bitrate by this share per step, back to the one that was set */
+#define OS_BACK 0.8       /* overshoot control: back up once the output is below this share of the max */
 #define FD_IFACE_EVERY 30.0 /* s between looking up the stream's route again */
 #define THERM_TEMP "/sys/devices/virtual/mstar/msys/TEMP_R"
 #define THERM_HYST 2      /* degrees below a band before going back up from it */
@@ -815,6 +815,26 @@ static int half_fps(const alink_t *a, const conf_t *c)
 /* something of the floor's ladder is on (frame rate or ISP stage): it goes back before the bitrate does */
 static int degraded(const alink_t *a) { return a->fps_cap < a->fps_full || a->isp_floor; }
 
+/* the pace back up: normal again after FD_UP_CALM without a step down. Checked before the wait it sets, else a wait
+ * doubled to FD_UP_MAX had to run out first */
+static void up_pace(alink_t *a, double t)
+{
+    if (t - a->last_down >= FD_UP_CALM)
+        a->up_wait = FD_UP_GAP;
+}
+
+/* a step down: if it undoes the last step up, the wait before the next one doubles (once per step up) */
+static void stepped_down(alink_t *a, double t)
+{
+    if (t - a->last_up < a->up_wait + FD_WINDOW + FD_SETTLE + 1) {
+        a->up_wait *= 2;
+        if (a->up_wait > FD_UP_MAX)
+            a->up_wait = FD_UP_MAX;
+        a->last_up = -1e9;
+    }
+    a->last_down = t;
+}
+
 /* with the bitrate at its floor (congested, or overshoot control): while the output is still above the target, the next
  * stage of the ladder: frame rate to half, then the ISP stage, then the frame rate lower (the step expected to fit,
  * not below ALINK_MIN_FPS) */
@@ -826,12 +846,7 @@ static void floor_frames(alink_t *a, const conf_t *c, double t, int wait_bitrate
     double r = a->actual / (a->current * 1.024); /* video0.bitrate is in units of 1024 bit/s */
     if (r < FD_OVER)
         return;
-    if (t - a->last_up < a->up_wait + FD_WINDOW + FD_SETTLE + 1) { /* the last step up did not hold */
-        a->up_wait *= 2;
-        if (a->up_wait > FD_UP_MAX)
-            a->up_wait = FD_UP_MAX;
-    }
-    a->last_down = t;
+    stepped_down(a, t);
     if (a->fps_cap > half_fps(a, c)) { /* 1: half the frames */
         a->fps_cap = half_fps(a, c);
         fps_update_r(a, c, "floor_fps");
@@ -870,12 +885,24 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
     if (a->actual < 0 || t - a->last_change < settle || t - a->fd_last_change < settle)
         return; /* the window still holds frames from before the last change */
     double r = a->actual / (a->current * 1.024); /* video0.bitrate is in units of 1024 bit/s */
+    if (!a->stats_ok && r >= a->os_max * OS_BACK && t - a->last_up < a->up_wait + settle + 1 &&
+        a->actual <= a->manual * 1.024) {
+        /* without modem stats, just after a stage of the ladder went back up: the output is above the (floor's) target
+         * but not above the bitrate that was set. The target follows the output (the camera sends that already)
+         * instead of undoing the stage, so the stages are not measured against the floor's 100 kbit/s */
+        a->os_ok_since = -1;
+        if (apply(a, c, (long)(a->actual / 1.024), "recover", NULL))
+            a->last_change = t;
+        return;
+    }
     if (r >= a->os_max) {
         a->os_ok_since = -1;
         if (a->current > clamp(a, c, 0)) {
             /* straight to where it should fit (clamped to the floor): one step, then the frame rate if needed */
-            if (apply(a, c, (long)(a->current / r), "overshoot", NULL))
+            if (apply(a, c, (long)(a->current / r), "overshoot", NULL)) {
                 a->last_change = t;
+                stepped_down(a, t); /* (a bitrate raised back too early: the next try waits longer) */
+            }
             if (a->current > clamp(a, c, 0) && a->current <= ladder_from(a, c))
                 floor_frames(a, c, t, 0); /* aggressive preset: the ladder already, alongside the cut */
         } else
@@ -890,25 +917,26 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
     }
     if (a->os_ok_since < 0)
         a->os_ok_since = t;
-    if (t - a->os_ok_since < a->p->up_after || t - a->fd_last_change < a->up_wait || t - a->last_change < FD_UP_GAP)
+    up_pace(a, t);
+    if (t - a->os_ok_since < a->p->up_after || t - a->fd_last_change < a->up_wait || t - a->last_change < a->up_wait)
         return;
     if (degraded(a)) {
-        frames_up(a, c, t); /* the ladder first */
+        frames_up(a, c, t); /* the ladder first: frame rate up to half, the ISP settings back, frame rate to full */
     } else if (a->current < a->manual) {
-        long step = (long)(a->current * OS_UP);
-        if (step < UP_MIN_STEP) step = UP_MIN_STEP;
-        long target = a->current + step > a->manual ? a->manual : a->current + step;
-        if (apply(a, c, target, "recover", NULL))
+        /* then the bitrate, in one step back to the one that was set: the output is below the target already, so a
+         * higher target cannot make it overshoot, and without modem stats there is no link to probe (the camera sent
+         * the set bitrate before, and more than that during the overshoot) */
+        if (apply(a, c, a->manual, "recover", NULL))
             a->last_change = t;
     }
 }
 
 /* link clear: one stage of the floor's ladder back (before the bitrate goes up): the frame rate up to half, the ISP
- * settings back, then the frame rate up to full */
+ * settings back, then the frame rate up to full. A frame-rate stage goes to the highest step the output, scaled by the
+ * frame rate, still fits at FD_AIM of the target, at least the next step (skips steps only where the encoder sends
+ * well below the target: a static scene at a low target; at 4000 kbit/s it fills the target even on a white wall) */
 static void frames_up(alink_t *a, const conf_t *c, double t)
 {
-    if (t - a->last_down >= FD_UP_CALM)
-        a->up_wait = FD_UP_GAP; /* calm for a while: normal pace again */
     a->fd_last_change = a->last_up = t;
     int half = half_fps(a, c);
     if (a->isp_floor && a->fps_cap >= half) {
@@ -921,6 +949,19 @@ static void frames_up(alink_t *a, const conf_t *c, double t)
             up = fd_step(a->fps_full, i);
             break;
         }
+    if (a->actual >= 0 && a->current > 0 && a->fps > 0) {
+        /* (a keyframe per second whatever the rate: the output grows less than the frame rate, this errs low) */
+        double r = a->actual / (a->current * 1.024);
+        for (int i = 0; i < FD_NSTEPS; i++) {
+            int st = fd_step(a->fps_full, i);
+            if (st <= up)
+                break;
+            if (r * st / a->fps <= FD_AIM) {
+                up = st;
+                break;
+            }
+        }
+    }
     if (a->isp_floor && up > half)
         up = half; /* the ISP stage goes before the frame rate passes half */
     a->fps_cap = up;
@@ -1054,6 +1095,7 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
     } else if (clear) {
         if (a->clear_since < 0)
             a->clear_since = t;
+        up_pace(a, t);
         if (!hold_up && degraded(a) && t - a->clear_since >= p->up_after) {
             if (a->actual >= 0 && a->actual > a->current * 1.024 * FD_OVER && a->current < p->max_bitrate &&
                 t - a->last_change >= MIN_GAP && t - a->fd_last_change >= FD_WINDOW + FD_SETTLE) {

@@ -74,7 +74,15 @@ link recovers, where it used to take ~33 s with overshoot control off and never 
 The **performance** preset is more aggressive: its ladder already starts once the bitrate is at or below 2000 kbit/s,
 alongside the cuts (e.g. congested: 4000 -> 1860 kbit/s and 30 fps at once, where balanced goes 4000 -> 2280 at
 60 fps). `ALINK_LADDER_FROM=<kbit/s>` overrides it for any preset (0 = only at the floor). One step every 3 s; a step up that has to be undone soon after doubles
-the wait (up to 60 s), 20 s without a step down brings it back to 3 s, so it does not bounce.
+the wait (up to 60 s), 20 s without a step down brings it back to 3 s, so it does not bounce. A frame-rate step up goes
+to the highest rate the output, scaled by the frame rate, still fits at 90 % of the target, at least the next step
+(this only skips steps where the encoder sends well below the target, e.g. a static scene at a low target; at
+4000 kbit/s it fills the target even on a white wall, and goes one step at a time).
+
+Measured on the bench without modem stats (overshoot control, performance, `ALINK_ENC_MIN=1000`): dark room -> 1000
+kbit/s, 10 fps, ISP stage in ~4 s; then a static white wall: 30 fps 3 s after the output drops (10 -> 30 in one step,
+the output was ~150 kbit/s), ISP settings back, 40, 60 fps, then 4000 kbit/s, all back ~15 s after. It used to take
+~135 s (with `ALINK_ENC_MIN=100`: the ladder, then the bitrate from 100 kbit/s in 10 % steps every 3 s).
 
 **Measuring the output.** From the transmit counters (`/sys/class/net/<if>/statistics/tx_bytes`, `tx_packets`) of
 the interface the stream leaves on, minus IP/UDP/RTP headers per packet, averaged over 1 s. The interface is found
@@ -85,8 +93,11 @@ from waybeam's `outgoing.server` and the routing table (`wg0` in flight, `eth0` 
 **4. Optional: bitrate overshoot control** (`ALINK_BITRATE_OVERSHOOT_CONTROL`, off by default). Watches the output
 all the time, congested or not: at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5) it lowers the
 bitrate (by the overshoot, in one step, not below the floor), and at the floor the ladder of 2. (~1.3 s per stage). Without
-modem stats it also recovers on its own: below 0.8 x the max for `up_after` s, frame rate first, then the bitrate in
-10 % steps back to the bitrate that was set (never above it). With modem stats the link decides when to go back up;
+modem stats it also recovers on its own: below 0.8 x the max for `up_after` s, the ladder first (frame rate up to
+half, the ISP settings back, frame rate to full), then the bitrate in one step back to the bitrate that was set (never
+above it; the output is below the target already, so a higher target cannot make it overshoot, and there is no link to
+probe). Just after a stage up, an output above the target but not above the set bitrate raises the target to it
+instead of undoing the stage (at the floor's 100 kbit/s almost any stage up would read as an overshoot). With modem stats the link decides when to go back up;
 while the output is still near the max (1.2 x the target at the default 1.5) there are no steps, but the target is
 raised to what the camera sends (a scene that needs more than the target; it adds no traffic).
 
