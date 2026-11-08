@@ -33,21 +33,32 @@
  *                interval-average fallback would read as clear.
  * Each is reported once when it starts (reason=edge / handover / no_service / service).
  *
- * Below 1 Mbit/s the frame rate goes down as well (/api/v1/set?video0.fps=): 40, 30, then 20 fps, so each frame keeps
- * about the bits it had at 1 Mbit/s and 60 fps. It also lowers the real floor: at 60 fps the encoder sends ~150 kbit/s
- * however low the bitrate is set.
+ * The bitrate goes no lower than ALINK_MIN_BITRATE (default 1000 kbit/s: waybeam does not encode below that). While the
+ * link stays congested with the bitrate at that floor (ALINK_LINK_LADDER, default true), the picture gets cheaper, one
+ * stage per the preset's ladder_gap (performance 0.5 s, the others 1.25 s):
+ *   40 fps (2/3) + despike 15, sharpness 0  ->  grayscale  ->  30 fps (1/2)  ->  20 15 12 10 fps (not below
+ *   ALINK_MIN_FPS)
+ * Only the link decides (the standing queue, as for the bitrate); what the camera actually sends is not looked at. A
+ * stage is skipped while the queue is draining fast enough to be gone within LADDER_DRAIN s since the last change, so
+ * the ladder does not go deeper than the link needs while the queue from before drains. Once the link is clear for
+ * up_after s the same way back, one stage per UP_GAP s (doubled up to UP_MAX after a stage up that had to be undone,
+ * back to UP_GAP after UP_CALM s without a stage down): 30 fps, grayscale off, 40 fps, the full rate with despike and
+ * sharpness back, and only then the bitrate. The camera's own ISP values are kept and put back; while forced they are
+ * set again every ISP_EVERY s (waybeam loses them on every restart). The frame rate goes through /api/v1/live/set
+ * (not written to flash) where the camera has it.
  *
  * While enabled it owns the bitrate: a change from someone else (e.g. the ground station's bitrate slider) is where it
  * carries on from. The bitrate and frame rate the camera had when modem_alink took over, or the last change from
  * someone else, are restored when it is disabled or stops. No stats for 3 s: the bitrate is held.
  *
- * Control on port 2226 (all interfaces), HTTP or UDP: enable=0|1 and preset=performance|balanced|quality, keys
- * optionally prefixed "alink.". Both answer with a status line (ALINK;...;enabled=1;preset=...;bitrate=...).
+ * Control on port 2226 (all interfaces), HTTP or UDP: enable=0|1, preset=performance|balanced|quality and
+ * link_ladder=0|1, keys optionally prefixed "alink.". Both answer with a status line (ALINK;...;enabled=1;preset=...;bitrate=...).
  *   curl 'http://<drone>:2226/?preset=performance&enable=1'       any path; no query = status only
  *   echo 'preset=quality;enable=1' | nc -u -w1 <drone> 2226
  *
- * /etc/masina.conf: ALINK_ENABLED=true|false (default true), ALINK_PRESET (default balanced), ALINK_CAMERA=host[:port]
- * (default 127.0.0.1:80), ALINK_MIN_BITRATE=<kbit/s> (default 1), ALINK_CONTROL_PORT (default 2226), GROUND_IP: every
+ * /etc/masina.conf: ALINK_ENABLED=true|false (default true), ALINK_PRESET (default performance), ALINK_CAMERA=host[:port]
+ * (default 127.0.0.1:80), ALINK_MIN_BITRATE=<kbit/s> (default 1000), ALINK_MIN_FPS (default 15),
+ * ALINK_LINK_LADDER=true|false (default true), ALINK_CONTROL_PORT (default 2226), GROUND_IP: every
  * change is sent there on port 2224 as "ALINK;time=...;enabled=...;preset=...;bitrate=...;...;reason=...".
  *
  * usage: modem_alink [performance|balanced|quality]      SIGINT/SIGTERM gives the camera back and exits
@@ -81,6 +92,19 @@
 #define HTTP_TIMEOUT 1    /* s */
 #define EDGE_GAP 2.0      /* dB: a network rule this close to firing (search, handover, release): no raising */
 #define HO_GRACE 1.0      /* s after a cell change without cuts: the queue the switch built drains on the new cell */
+#define LADDER_DRAIN 2.0  /* s: no stage down while the standing queue is on course to be gone within this */
+#define UP_GAP 3.0        /* s between stages back up ... */
+#define UP_MAX 60.0       /* ... doubled up to this after a stage up that had to be undone ... */
+#define UP_CALM 20.0      /* ... and back to UP_GAP after this long without a stage down */
+#define ISP_EVERY 3.0     /* s between checks that the camera still has the forced ISP values */
+#define ISP_N 3
+
+/* the ladder's ISP values (/api/v1/iq): despike 15 and sharpness 0 (ISP_SOFT), grayscale too (ISP_FULL) */
+static const struct { const char *iq; int floor; } ISP_KEYS[ISP_N] = {
+    { "nr_despike", 15 }, { "sharpness", 0 }, { "color_to_gray", 1 },
+};
+enum { ISP_OFF, ISP_SOFT, ISP_FULL };
+static int isp_forced(int level, int i) { return level >= ISP_FULL || (level == ISP_SOFT && i < 2); }
 
 /* ---- presets */
 typedef struct {
@@ -95,22 +119,25 @@ typedef struct {
     double up_after, up_step;          /* raise after up_after s clear, by up_step of the bitrate per line */
     double qmin_high, qmin_clear;      /* standing queue (qdelay_min, ms): congested at >= qmin_high with
                                         * >= qbytes_min KB still queued (or >= qbytes_high KB), clear below qmin_clear */
+    double ladder_gap;                 /* s between the ladder's stages down (and after the bitrate reached the floor) */
 } preset_t;
 
 /* the small qbytes_min keeps a near-idle link from looking congested: modem_link floors the rate at 0.5 Mbit/s,
  * so a 3 KB burst alone already reads as 50 ms */
 static const preset_t PRESETS[] = {
-    /*               max     congested       aim          cut           clear     raise            standing */
-    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075,     10, 3 },  /* ~3 %/s */
-    { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125,     20, 5 },  /* ~5 %/s */
-    { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10 }, /* ~8 %/s */
+    /*               max     congested       aim          cut           clear     raise            standing  ladder */
+    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075,     10, 3,    0.5 },  /* ~3 %/s */
+    { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125,     20, 5,    1.25 }, /* ~5 %/s */
+    { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10,   1.25 }, /* ~8 %/s */
 };
 
-/* below `below` kbit/s use `fps`; back up only at 20 % above the step, so the frame rate does not flap */
-static const struct {
-    long below;
-    int fps;
-} FPS_STEPS[] = { { 1000, 40 }, { 667, 30 }, { 500, 20 } };
+/* frame-rate steps, highest first: even decimations of the full rate (60: 60 40 30 20 15 12 10) */
+#define FPS_NSTEPS 7
+static int fps_step(int full, int i)
+{
+    static const int num[FPS_NSTEPS] = { 1, 2, 1, 1, 1, 1, 1 }, den[FPS_NSTEPS] = { 1, 3, 2, 3, 4, 5, 6 };
+    return full * num[i] / den[i];
+}
 
 static volatile sig_atomic_t stop;
 static void on_sig(int s) { (void)s; stop = 1; }
@@ -147,17 +174,21 @@ typedef struct {
     char camera_port[8];
     char preset[32];
     int enabled, control_port;
-    long min_bitrate; /* kbit/s */
+    long min_bitrate; /* kbit/s: the floor */
+    int min_fps;      /* the ladder's lowest frame rate */
+    int link_ladder;  /* ALINK_LINK_LADDER */
 } conf_t;
 
 /* the last occurrence of a key wins, as in Config::readConfig */
 static void conf_read(conf_t *c)
 {
     char camera[128] = "127.0.0.1:80", on[16];
-    snprintf(c->preset, sizeof(c->preset), "balanced");
+    snprintf(c->preset, sizeof(c->preset), "performance");
     c->enabled = 1;
     c->control_port = 2226;
-    c->min_bitrate = 1;
+    c->min_bitrate = 1000;
+    c->min_fps = 15;
+    c->link_ladder = 1;
     FILE *f = fopen(MASINA_CONF, "r");
     if (f) {
         char buf[256];
@@ -169,6 +200,9 @@ static void conf_read(conf_t *c)
             sscanf(buf, "ALINK_CONTROL_PORT=%d", &c->control_port);
             if (sscanf(buf, "ALINK_ENABLED=%15s", on) == 1 && truthy(on) >= 0)
                 c->enabled = truthy(on);
+            sscanf(buf, "ALINK_MIN_FPS=%d", &c->min_fps);
+            if (sscanf(buf, "ALINK_LINK_LADDER=%15s", on) == 1 && truthy(on) >= 0)
+                c->link_ladder = truthy(on);
         }
         fclose(f);
     } else
@@ -199,7 +233,7 @@ static int http_get(const conf_t *c, const char *path, char *body, size_t size)
     int ok = connect(fd, res->ai_addr, res->ai_addrlen) == 0;
     freeaddrinfo(res);
 
-    char buf[2048];
+    char buf[8192]; /* /api/v1/iq is ~4 KB */
     size_t n = 0;
     if (ok) {
         int len = snprintf(buf, sizeof(buf), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, c->camera_host);
@@ -244,6 +278,37 @@ static int camera_set(const conf_t *c, const char *key, long value)
     char path[80], body[512];
     snprintf(path, sizeof(path), "/api/v1/set?%s=%ld", key, value);
     return http_get(c, path, body, sizeof(body)) == 200;
+}
+
+/* not written to the camera's flash where it has /api/v1/live/set, else camera_set */
+static int camera_set_live(const conf_t *c, const char *key, long value)
+{
+    static int no_live;
+    char path[80], body[512];
+    if (!no_live) {
+        snprintf(path, sizeof(path), "/api/v1/live/set?%s=%ld", key, value);
+        int code = http_get(c, path, body, sizeof(body));
+        if (code == 200)
+            return 1;
+        if (code != 404)
+            return 0;
+        no_live = 1; /* older camera API */
+    }
+    return camera_set(c, key, value);
+}
+
+/* the value of `name` in /api/v1/iq ({"name":{...,"value":N}} or {"name":{"value":true}}), -1 if not found */
+static int iq_value(const char *body, const char *name)
+{
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\":{", name);
+    const char *p = strstr(body, pat);
+    if (!p || !(p = strstr(p, "\"value\":")))
+        return -1;
+    p += 8;
+    if (!strncmp(p, "true", 4)) return 1;
+    if (!strncmp(p, "false", 5)) return 0;
+    return *p >= '0' && *p <= '9' ? atoi(p) : -1;
 }
 
 /* ---- modem_link stats */
@@ -317,6 +382,14 @@ typedef struct {
     int edge;             /* a network rule is close to firing (EDGE_GAP) */
     int cell;             /* serving cell: 0 not seen yet, 1 there (earfcn, pci), 2 lost */
     double earfcn, pci, grace_until;
+    int link_ladder;      /* congestion at the floor goes on down the ladder (ALINK_LINK_LADDER, control port) */
+    int fps_cap;          /* frame rate the ladder allows (fps_full when not on it) */
+    int isp_floor;        /* the ladder's ISP stage: ISP_OFF, ISP_SOFT, ISP_FULL */
+    int isp_saved[ISP_N]; /* the camera's values before it, to put back (-1 unknown) */
+    double isp_next;      /* next check that the camera still has the forced values */
+    double stage_t;       /* last stage down or up */
+    double up_wait, last_up, last_down; /* s between stages back up, and when it last went up / down */
+    double change_queue, change_t;      /* standing queue (KB) at the last change while congested, and when */
 } alink_t;
 
 static int udp_fd = -1;
@@ -343,8 +416,8 @@ static size_t status_core(const alink_t *a, char *o, size_t size)
     char tm[16];
     time_t wall = time(NULL);
     strftime(tm, sizeof(tm), "%H:%M:%S", localtime(&wall));
-    return snprintf(o, size, "ALINK;time=%s;enabled=%d;preset=%s;bitrate=%ldkbps;max=%ldkbps;fps=%d", tm, a->enabled, a->p->name,
-                    a->current, a->p->max_bitrate, a->fps);
+    return snprintf(o, size, "ALINK;time=%s;enabled=%d;preset=%s;bitrate=%ldkbps;max=%ldkbps;fps=%d;fps_cap=%d;isp_floor=%d;link_ladder=%d",
+                    tm, a->enabled, a->p->name, a->current, a->p->max_bitrate, a->fps, a->fps_cap, a->isp_floor, a->link_ladder);
 }
 
 static size_t num_or_na(char *o, size_t size, const char *key, int ok, double v, int prec, const char *unit)
@@ -392,6 +465,11 @@ static int camera_sync(alink_t *a, const conf_t *c)
         return 0;
     }
     a->camera_ok = 1;
+    if (a->fps != a->fps_full) { /* we lowered it: an encoder restart puts the configured rate back */
+        long f = camera_get(c, "video0.fps");
+        if (f > 0 && f != a->fps)
+            a->fps = (int)f; /* the next fps_update sets ours again */
+    }
     if (labs(b - a->current) > a->current / 50) {
         long prev = a->current;
         a->current = a->manual = b;
@@ -412,26 +490,69 @@ static long clamp(const alink_t *a, const conf_t *c, long target)
     return target;
 }
 
-/* below 1 Mbit/s fewer frames (FPS_STEPS), back to the full rate when the bitrate recovers */
-static void fps_update(alink_t *a, const conf_t *c)
+/* the frame rate: full, or what the ladder allows (fps_cap) */
+static void fps_update_r(alink_t *a, const conf_t *c, const char *reason)
 {
-    int fps = a->fps_full;
-    for (size_t i = 0; i < sizeof(FPS_STEPS) / sizeof(FPS_STEPS[0]); i++) {
-        long below = FPS_STEPS[i].below;
-        if (a->fps <= FPS_STEPS[i].fps)
-            below = below * 6 / 5; /* already at or under this step: leave it only at 20 % above */
-        if (a->current < below && FPS_STEPS[i].fps < fps)
-            fps = FPS_STEPS[i].fps;
-    }
+    int fps = a->fps_cap > 0 && a->fps_cap < a->fps_full ? a->fps_cap : a->fps_full;
     if (fps == a->fps || now() < a->fps_retry)
         return;
-    if (!camera_set(c, "video0.fps", fps)) {
+    if (!camera_set_live(c, "video0.fps", fps)) {
         fprintf(stderr, "camera %s:%s did not accept %d fps\n", c->camera_host, c->camera_port, fps);
         a->fps_retry = now() + FPS_RETRY;
         return;
     }
     a->fps = fps;
-    report(a, "fps", a->current, NULL);
+    report(a, reason, a->current, NULL);
+}
+
+static void fps_update(alink_t *a, const conf_t *c) { fps_update_r(a, c, "fps"); }
+
+/* ---- the ladder's ISP stage */
+
+/* sets the forced values the camera does not have (waybeam drops them on every start/reinit) */
+static void isp_keep(alink_t *a, const conf_t *c, double t)
+{
+    if (!a->isp_floor || t < a->isp_next)
+        return;
+    a->isp_next = t + ISP_EVERY;
+    static char body[8192];
+    if (http_get(c, "/api/v1/iq", body, sizeof(body)) != 200)
+        return; /* camera not up yet: next time */
+    for (int i = 0; i < ISP_N; i++) {
+        if (!isp_forced(a->isp_floor, i) || iq_value(body, ISP_KEYS[i].iq) == ISP_KEYS[i].floor)
+            continue;
+        char path[64], reply[256];
+        snprintf(path, sizeof(path), "/api/v1/iq/set?%s=%d", ISP_KEYS[i].iq, ISP_KEYS[i].floor);
+        if (http_get(c, path, reply, sizeof(reply)) != 200)
+            fprintf(stderr, "camera %s:%s did not accept %s=%d\n", c->camera_host, c->camera_port, ISP_KEYS[i].iq,
+                    ISP_KEYS[i].floor);
+    }
+}
+
+/* the ISP stage to a level, the camera's values kept first; what the new level no longer forces is put back (a setting
+ * the camera had on auto comes back as a fixed value until waybeam restarts) */
+static void isp_set(alink_t *a, const conf_t *c, double t, int level)
+{
+    static char body[8192];
+    int old = a->isp_floor;
+    if (level == old)
+        return;
+    if (!old) {
+        int got = http_get(c, "/api/v1/iq", body, sizeof(body)) == 200;
+        for (int i = 0; i < ISP_N; i++)
+            a->isp_saved[i] = got ? iq_value(body, ISP_KEYS[i].iq) : -1;
+    }
+    a->isp_floor = level;
+    for (int i = 0; i < ISP_N; i++) {
+        if (!isp_forced(old, i) || isp_forced(level, i) || a->isp_saved[i] < 0)
+            continue;
+        char path[64], reply[256];
+        snprintf(path, sizeof(path), "/api/v1/iq/set?%s=%d", ISP_KEYS[i].iq, a->isp_saved[i]);
+        http_get(c, path, reply, sizeof(reply));
+    }
+    a->isp_next = 0;
+    isp_keep(a, c, t); /* at once */
+    report(a, level > old ? "floor_isp" : "recover_isp", a->current, NULL);
 }
 
 /* returns 1 if the bitrate changed */
@@ -467,7 +588,7 @@ static void camera_attach(alink_t *a, const conf_t *c, const char *reason)
     long f = camera_get(c, "video0.fps");
     a->camera_ok = 1;
     a->current = a->manual = b;
-    a->fps = a->fps_full = f > 0 ? (int)f : FPS_DEFAULT;
+    a->fps = a->fps_full = a->fps_cap = f > 0 ? (int)f : FPS_DEFAULT;
     a->was_congested = 0;
     a->clear_since = -1;
     report(a, reason, b, NULL);
@@ -486,7 +607,9 @@ static void release(alink_t *a, const conf_t *c, const char *reason)
     camera_sync(a, c); /* a change from someone else just now is what stays */
     if (a->current != a->manual && camera_set(c, "video0.bitrate", a->manual))
         a->current = a->manual;
-    if (a->fps != a->fps_full && camera_set(c, "video0.fps", a->fps_full))
+    a->fps_cap = a->fps_full;
+    isp_set(a, c, now(), ISP_OFF);
+    if (a->fps != a->fps_full && camera_set_live(c, "video0.fps", a->fps_full))
         a->fps = a->fps_full;
     report(a, reason, prev, NULL);
 }
@@ -513,6 +636,75 @@ static void link_state(alink_t *a, const link_t *l, double t)
     }
 }
 
+/* ---- the ladder: congestion past the bitrate floor */
+
+/* a stage's frame rate: num/den of the full rate (40 = 2/3, 30 = 1/2 of 60), not below ALINK_MIN_FPS */
+static int stage_fps(const alink_t *a, const conf_t *c, int num, int den)
+{
+    int f = a->fps_full * num / den;
+    return f < c->min_fps ? c->min_fps : f;
+}
+
+/* something of the ladder is on: it goes back before the bitrate does */
+static int degraded(const alink_t *a) { return a->fps_cap < a->fps_full || a->isp_floor; }
+
+/* congested with the bitrate at its floor: the next stage, at most one per ladder_gap, and none while the standing
+ * queue (KB) is on course to be gone within LADDER_DRAIN s since the last change:
+ * 40 fps (2/3) + despike and sharpness, grayscale, 30 fps (1/2), then 20 15 12 10 (not below ALINK_MIN_FPS) */
+static void ladder_down(alink_t *a, const conf_t *c, double t, double queue)
+{
+    double gap = a->p->ladder_gap, since = t - a->change_t, fell = a->change_queue - queue;
+    if (t - a->last_change < gap || t - a->stage_t < gap)
+        return;
+    if (fell > 0 && since > 0 && queue / (fell / since) <= LADDER_DRAIN)
+        return; /* draining: the last change is doing it */
+    int s40 = stage_fps(a, c, 2, 3), isp = a->isp_floor, fps = a->fps_cap;
+    if (fps > s40 || isp < ISP_SOFT) { /* 1: fewer frames, less noise */
+        isp = isp < ISP_SOFT ? ISP_SOFT : isp;
+        fps = fps > s40 ? s40 : fps;
+    } else if (isp < ISP_FULL) { /* 2: grayscale */
+        isp = ISP_FULL;
+    } else { /* 3: fewer frames still */
+        fps = -1;
+        for (int i = 0; i < FPS_NSTEPS && fps < 0; i++) {
+            int st = fps_step(a->fps_full, i);
+            if (st < a->fps_cap && st >= c->min_fps)
+                fps = st;
+        }
+        if (fps < 0)
+            return; /* at ALINK_MIN_FPS */
+    }
+    if (t - a->last_up < a->up_wait + gap + 1) { /* the last stage up did not hold: slower next time */
+        a->up_wait *= 2;
+        if (a->up_wait > UP_MAX)
+            a->up_wait = UP_MAX;
+        a->last_up = -1e9; /* once per stage up */
+    }
+    a->last_down = a->stage_t = a->change_t = t;
+    a->change_queue = queue;
+    isp_set(a, c, t, isp);
+    if (fps != a->fps_cap) {
+        a->fps_cap = fps;
+        fps_update_r(a, c, "floor_fps");
+    }
+}
+
+/* clear: one stage back: 30 fps (from anything lower), grayscale off, 40 fps, the full rate with despike and sharpness */
+static void ladder_up(alink_t *a, const conf_t *c, double t)
+{
+    int s40 = stage_fps(a, c, 2, 3), s30 = stage_fps(a, c, 1, 2);
+    a->stage_t = a->last_up = t;
+    if (a->isp_floor >= ISP_FULL && a->fps_cap >= s30) {
+        isp_set(a, c, t, ISP_SOFT);
+        return;
+    }
+    int up = a->fps_cap < s30 ? s30 : a->fps_cap < s40 ? s40 : a->fps_full;
+    if (a->isp_floor == ISP_SOFT && up > s40)
+        isp_set(a, c, t, ISP_OFF);
+    a->fps_cap = up;
+    fps_update_r(a, c, "recover_fps");
+}
+
 static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
 {
     const preset_t *p = a->p;
@@ -535,6 +727,10 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
         apply(a, c, p->max_bitrate, "max", l); /* someone else set more than the preset allows */
     } else if (congested) {
         a->clear_since = -1;
+        if (!a->was_congested) { /* the queue the ladder's drain check starts from */
+            a->change_queue = drain_kb;
+            a->change_t = t;
+        }
         double target = a->current * p->down_factor;
         int cut;
         if (l->has_ul) {
@@ -548,12 +744,21 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
             cut = !a->was_congested || drain_kb >= a->last_queue; /* no rate: cut again only while the queue grows */
         if (target < a->current * p->cut_floor)
             target = a->current * p->cut_floor;
-        if (cut && !grace && t - a->last_change >= MIN_GAP && apply(a, c, (long)target, "congestion", l))
-            a->last_change = t;
+        if (cut && !grace && t - a->last_change >= MIN_GAP && apply(a, c, (long)target, "congestion", l)) {
+            a->last_change = a->change_t = t;
+            a->change_queue = drain_kb;
+        } else if (!grace && a->link_ladder && a->current <= clamp(a, c, 0))
+            ladder_down(a, c, t, drain_kb); /* the bitrate cannot go lower: the ladder */
     } else if (clear) {
         if (a->clear_since < 0)
             a->clear_since = t;
-        if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP) {
+        if (t - a->last_down >= UP_CALM)
+            a->up_wait = UP_GAP; /* calm for a while: normal pace again */
+        if (degraded(a)) {
+            /* the ladder back first, the bitrate once it is all back */
+            if (!hold_up && t - a->clear_since >= p->up_after && t - a->stage_t >= a->up_wait)
+                ladder_up(a, c, t);
+        } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP) {
             long step = (long)(a->current * p->up_step);
             if (t - a->cap_time >= CAP_VALID && step < p->max_bitrate * PROBE_STEP)
                 step = (long)(p->max_bitrate * PROBE_STEP);
@@ -598,6 +803,14 @@ static int command(alink_t *a, const conf_t *c, char *q)
             } else if (!on && a->enabled) {
                 a->enabled = 0;
                 release(a, c, "disable");
+            }
+        } else if (!strcmp(tok, "link_ladder")) {
+            int on = truthy(v);
+            if (on < 0) {
+                ok = 0;
+            } else if (on != a->link_ladder) {
+                a->link_ladder = on;
+                report(a, on ? "link_ladder_on" : "link_ladder_off", a->current, NULL);
             }
         } else if (!strcmp(tok, "preset")) {
             const preset_t *p = preset_find(v);
@@ -691,13 +904,15 @@ int main(int argc, char **argv)
 {
     static conf_t c;
     conf_read(&c);
-    static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9 };
+    static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9,
+                         .stage_t = -1e9, .up_wait = UP_GAP, .last_up = -1e9, .last_down = -1e9 };
     const char *name = argc > 1 ? argv[1] : c.preset;
     if (!(a.p = preset_find(name))) {
-        fprintf(stderr, "unknown preset %s (performance, balanced, quality), using balanced\n", name);
-        a.p = preset_find("balanced");
+        fprintf(stderr, "unknown preset %s (performance, balanced, quality), using performance\n", name);
+        a.p = preset_find("performance");
     }
     a.enabled = c.enabled;
+    a.link_ladder = c.link_ladder;
     udp_open(c.ground_ip);
 
     int in = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -760,6 +975,7 @@ int main(int argc, char **argv)
             control_http(&a, &c);
         if (r > 0 && ctl_udp >= 0 && FD_ISSET(ctl_udp, &rd))
             control_udp(&a, &c);
+        isp_keep(&a, &c, t);
         if (a.enabled && a.current && a.stats_ok && t - a.last_stats >= STATS_TIMEOUT) {
             a.stats_ok = 0;
             report(&a, "no_data", a.current, NULL); /* the bitrate stays where it is until stats come back */
