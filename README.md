@@ -90,9 +90,14 @@ from waybeam's `outgoing.server` and the routing table (`wg0` in flight, `eth0` 
 `ALINK_IFACE`. Matches what the ground receives within ~3 %. Note: waybeam's `video0.bitrate` is in units of
 1024 bit/s.
 
-**4. Optional: bitrate overshoot control** (`ALINK_BITRATE_OVERSHOOT_CONTROL`, off by default). Watches the output
-all the time, congested or not: at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5) it lowers the
-bitrate (by the overshoot, in one step, not below the floor), and at the floor the ladder of 2. (~1.3 s per stage). Without
+**4. Optional: bitrate overshoot control** (`ALINK_BITRATE_OVERSHOOT_CONTROL`, off by default). Watches the output:
+at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5) it lowers the bitrate (by the overshoot, in one
+step, not below the floor), and at the floor the ladder of 2. (~1.3 s per stage). The performance preset at 2x the
+target or more goes straight to the floor and takes every stage expected to be needed at once (bench, dark room:
+4000 kbit/s 60 fps -> 1000 kbit/s 10 fps grayscale in one step, ~0.5 s after the output rose, where the stages took
+~4.4 s). With modem stats it only reacts while the link is not clear (the standing queue at or above the preset's
+clear thresholds, e.g. performance 3 ms with 5 KB, or congested): as long as the link carries the overshoot, it is
+left alone. Without modem stats (bench, or `modem_link` not running) it always reacts. Without
 modem stats it also recovers on its own: below 0.8 x the max for `up_after` s, the ladder first (frame rate up to
 half, the ISP settings back, frame rate to full), then the bitrate in one step back to the bitrate that was set (never
 above it; the output is below the target already, so a higher target cannot make it overshoot, and there is no link to
