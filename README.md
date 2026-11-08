@@ -64,12 +64,8 @@ at 60 fps even at the coarsest quantizer. Measured, dark scene at 1440p60 with o
 4000: 0 s bitrate 4000 -> 1000, 1.4 s 30 fps, 2.7 s ISP stage, 3.9 s 15 fps: output ~21 -> ~2 Mbit/s.
 
 **3. Recovery.** When the link is clear again, the same way back: frame rate up to 30, the ISP settings back, frame
-rate up to full, and only then the bitrate. While the camera sends more than the target (a scene that needs more than
-the floor), the target is first raised to what it sends (up to the preset's max) before each stage: the link is
-already clear with that much, so it adds no traffic, and the next stage isn't read as an overshoot of a target the
-scene can't meet. Without this, overshoot control undid every stage up and the bitrate stayed at the floor; simulated
-(performance, link dropping to 0.7 Mbit/s for 10 s, very dark scene): back at 4000 kbit/s and 60 fps ~14 s after the
-link recovers, where it used to take ~33 s with overshoot control off and never got there with it on.
+rate up to full, and only then the bitrate. A stage up that sends more than the floor's target is not undone as an
+overshoot while the link is clear: overshoot control only reacts there at 8x the floor (see 4.).
 
 The **performance** preset is more aggressive: its ladder already starts once the bitrate is at or below 2000 kbit/s,
 alongside the cuts (e.g. congested: 4000 -> 1860 kbit/s and 30 fps at once, where balanced goes 4000 -> 2280 at
@@ -95,9 +91,41 @@ at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5) it lowers t
 step, not below the floor), and at the floor the ladder of 2. (~1.3 s per stage). The performance preset at 2x the
 target or more goes straight to the floor and takes every stage expected to be needed at once (bench, dark room:
 4000 kbit/s 60 fps -> 1000 kbit/s 10 fps grayscale in one step, ~0.5 s after the output rose, where the stages took
-~4.4 s). With modem stats it only reacts while the link is not clear (the standing queue at or above the preset's
-clear thresholds, e.g. performance 3 ms with 5 KB, or congested): as long as the link carries the overshoot, it is
-left alone. Without modem stats (bench, or `modem_link` not running) it always reacts. Without
+~4.4 s). With modem stats, how much overshoot is too much depends on the link:
+
+| link | output vs target | reaction |
+|---|---|---|
+| clear | below 8x the floor (8000 kbit/s at the 1000 floor: 8x at the floor, 4x at 2000, 2x at 4000; never below 1.5x) | none, the link carries it |
+| clear | 8x the floor and more | lowered step by step (bitrate, then one stage of the ladder per measurement) |
+| struggling (standing queue at or above the preset's clear thresholds, e.g. performance 3 ms with 5 KB, or congested) | `ALINK_BITRATE_OVERSHOOT_MAX` (1.5x) and more | lowered step by step |
+| struggling | 2x and more (algorithm `link`) | everything at once |
+
+This is the default algorithm, `link`. **`ALINK_ALGO`** (or `algo=<name|1..8>` on the control port) switches between
+eight, to compare in flight; the status line shows `algo=`. Without modem stats every algorithm reacts as with the link
+struggling.
+
+| # | `ALINK_ALGO` | reacts | down | back up (from 10 fps grayscale, g = grayscale) | gap | bitrate after |
+|---|---|---|---|---|---|---|
+| 1 | `classic` | always at 1.5x | one stage per measurement | 12g 15g 20g 30g, color, 40, 60; target follows the output before each stage | 3 s | link probing |
+| 2 | `jump` | always at 1.5x | at 2x all at once | as classic, frame-rate steps the output fits skipped | 3 s | link probing |
+| 3 | `link` (default) | clear link: 8x the floor; struggling: 1.5x | at 2x (struggling) all at once | 12g ... 30g, color, 40, 60 (fitting steps skipped) | 3 s | link probing |
+| 4 | `link_fast` | as link | as link | as link | 1.5 s | straight back |
+| 5 | `link_coarse` | as link | as link | 30g, color, 60 | 2 s | straight back |
+| 6 | `link_gray_last` | as link | as link | 12g ... 60g, then color (fitting steps skipped) | 1.5 s | straight back |
+| 7 | `link_gray_coarse` | as link | as link | 30g, 60g, color | 2 s | straight back |
+| 8 | `link_snap` | as link | as link | 60 and color at once | 2 s | straight back |
+
+"Straight back" (with modem stats): once the ladder is back, the bitrate goes in one step back to where overshoot
+control cut it from (a congestion cut in between cancels it, the link decides then); otherwise the link's probing
+steps (performance: ~20 s from 1000 to 4000 kbit/s). A stage that has to be undone doubles the gap (up to 60 s), 20 s
+without a step down brings it back. The first stage waits for the preset's `up_after` (3 s) of clear link. Measured
+with `link` on the real modem (dark room, then a white wall): 7 stages 3-6 s apart and ~20 s of bitrate probing,
+~45 s in all; the encoder fills the floor's 1000 kbit/s even on a white wall, so skipping fitting steps rarely helps
+there, the gap and coarser stages do.
+
+Without modem stats (bench, or `modem_link` not running) it reacts as with the link struggling. Real modem, dark
+room: the standing queue jumped to ~216 KB / 92 ms and the one-step cut came on the next stats line, ~0.5 s after
+the queue started building. Without
 modem stats it also recovers on its own: below 0.8 x the max for `up_after` s, the ladder first (frame rate up to
 half, the ISP settings back, frame rate to full), then the bitrate in one step back to the bitrate that was set (never
 above it; the output is below the target already, so a higher target cannot make it overshoot, and there is no link to
@@ -157,6 +185,7 @@ bitrate is held. Frame-rate changes use `/api/v1/live/set` (not written to flash
 | `ALINK_IFACE` | `auto` | interface to measure the output on; `auto` = route to waybeam's `outgoing.server` |
 | `ALINK_BITRATE_OVERSHOOT_CONTROL` | `false` | watch the output all the time (see 4.) |
 | `ALINK_BITRATE_OVERSHOOT_MAX` | `1.5` | output/target that triggers it (not below 1.05) |
+| `ALINK_ALGO` | `link` | overshoot / recovery algorithm, name or 1..8 (see 4.) |
 | `ALINK_ISP_DESPIKE` | not set | ISP despike 0..15 kept on the camera (see 6.) |
 | `ALINK_ISP_SHARPNESS` | not set | ISP sharpness 0..255 kept on the camera |
 | `ALINK_ISP_GRAYSCALE` | not set | `true` / `false`: grayscale kept on the camera |

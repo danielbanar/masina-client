@@ -43,19 +43,19 @@
  * starts the ladder already at 2000 kbit/s, alongside the bitrate cuts (ALINK_LADDER_FROM overrides, 0 = only at the
  * floor). A dark, high-gain or very
  * detailed scene can need far more than the floor at the full frame rate. Recovering goes back the same way: the frame
- * rate up to half, the ISP settings back, the frame rate to full, and only then the bitrate. But while the camera sends
- * more than the target (the scene needs more than the floor), the target is first raised to what it sends, up to the
- * preset's max, before each stage: the link is clear with that much already, so it adds nothing, and the stage after
- * it is then measured against what the camera really sends (with overshoot control, a stage up at the floor's target
- * reads as an overshoot at once and is undone, over and over, so the bitrate never came back).
+ * rate up to half, the ISP settings back, the frame rate to full, and only then the bitrate.
  * ALINK_BITRATE_OVERSHOOT_CONTROL=true also watches the output: at or above ALINK_BITRATE_OVERSHOOT_MAX times the
  * target (default 1.5) the bitrate goes down (by the overshoot, in one step, not below the floor; the performance
  * preset at 2x and more: straight to the floor and every stage of the ladder expected to be needed at once), and at
- * the floor the frame rate. With modem stats only while the link is not clear (a standing queue building, or
- * congested): a clear link carries the overshoot. Without modem stats always. Without modem stats the way back is its own:
+ * the floor the frame rate. With modem stats and a clear link the link carries an overshoot: only an output at
+ * OS_CLEAR x the floor (8000 kbit/s at 1000) and more, step by step; with the link not clear (a standing queue building, or congested) at the set max, and at
+ * the algorithm's jump everything at once. Without modem stats as with the link not clear. Without modem stats the way back is its own:
  * below OS_BACK of the max for up_after s, the ladder's stages first (just after one, an output above the target but
  * not above the set bitrate raises the target to it instead of undoing the stage), then the bitrate in one step back
  * to the one that was set (a higher target cannot overshoot, and there is no link to probe).
+ *
+ * How it reacts and comes back is switchable for comparing in flight (ALINK_ALGO, control port algo=<name|1..8>):
+ * classic, jump, link (default), link_fast, link_coarse, link_gray_last, link_gray_coarse, link_snap; see ALGOS.
  *
  * Thermal: the SoC temperature (/sys/devices/virtual/mstar/msys/TEMP_R) caps the frame rate by /etc/temp_profile.conf
  * ("<min>-<max> <fps|-> <scale of the full rate|-> <update s>", first matching line), back up THERM_HYST degrees below
@@ -72,7 +72,7 @@
  * someone else, are restored when it is disabled or stops. No stats for 3 s: the bitrate is held.
  *
  * Control on port 2226 (all interfaces), HTTP or UDP: enable=0|1, preset=performance|balanced|quality,
- * bitrate_overshoot_control=0|1, bitrate_overshoot_max=<x>, isp_despike=<0..15>, isp_sharpness=<0..255> and
+ * bitrate_overshoot_control=0|1, bitrate_overshoot_max=<x>, algo=<name|1..8>, isp_despike=<0..15>, isp_sharpness=<0..255> and
  * isp_grayscale=0|1 (-1 = stop managing that one) (not kept: masina.conf sets them at start), keys
  * optionally prefixed "alink.". Both answer with a status line (ALINK;...;enabled=1;preset=...;bitrate=...).
  *   curl 'http://<drone>:2226/?preset=performance&enable=1'       any path; no query = status only
@@ -84,6 +84,7 @@
  * the preset's), ALINK_MIN_FPS (default 15), ALINK_IFACE=auto|<ifname> (default auto),
  * ALINK_THERMAL=true|false (default true), ALINK_TEMP_PROFILE=<path> (default /etc/temp_profile.conf),
  * ALINK_BITRATE_OVERSHOOT_CONTROL=true|false (default false), ALINK_BITRATE_OVERSHOOT_MAX=<x> (default 1.5),
+ * ALINK_ALGO=<name|1..8> (default link),
  * ALINK_ISP_DESPIKE=<0..15>, ALINK_ISP_SHARPNESS=<0..255>, ALINK_ISP_GRAYSCALE=true|false (default: not set), GROUND_IP: every
  * change is sent there on port 2224 as "ALINK;time=...;enabled=...;preset=...;bitrate=...;...;reason=...".
  *
@@ -123,13 +124,16 @@
 #define FD_SAMPLE 0.25    /* s between transmit-counter samples */
 #define FD_WINDOW 1.0     /* s the output is averaged over (a 1 s GOP's keyframe) */
 #define FD_SETTLE 0.25    /* s after a change before a window counts, on top of FD_WINDOW: going down is fast ... */
-#define FD_UP_GAP 3.0     /* ... going back up slow: s between steps up ... */
+/* ... going back up slow: s between steps up (the algorithm's gap) ... */
 #define FD_UP_MAX 60.0    /* ... doubled up to this after a step up that had to be undone (it would only bounce) ... */
-#define FD_UP_CALM 20.0   /* ... and back to FD_UP_GAP after this long without a step down */
+#define FD_UP_CALM 20.0   /* ... and back to the gap after this long without a step down */
 #define FD_OVER 1.05      /* at the floor, output above this share of the target means frames have to go */
 #define FD_AIM 0.90       /* drop to the step expected to give this share of the target */
 #define FD_HDR 40         /* bytes per packet that are not video: IPv4 20 + UDP 8 + RTP 12 (+14 on Ethernet) */
 #define OS_BACK 0.8       /* overshoot control: back up once the output is below this share of the max */
+#define OS_CLEAR 8.0      /* overshoot control with modem stats and a clear link: the output is left alone below this
+                           * x the bitrate floor (the link carries it; 8000 kbit/s at 1000), at or above it lowered
+                           * step by step all the same */
 #define ISP_GAIN 2.0      /* the output is taken to drop by this with the ISP stage (measured ~4: despike + sharpness
                            * halve it, grayscale halves it again; the lower guess drops more frames, recovery adds back) */
 #define FD_IFACE_EVERY 30.0 /* s between looking up the stream's route again */
@@ -162,18 +166,58 @@ typedef struct {
                                         * >= qbytes_min KB still queued (or >= qbytes_high KB), clear below qmin_clear */
     long ladder_from;                  /* kbit/s: the floor's ladder (30 fps, ISP stage, lower fps) already starts at or
                                         * below this, alongside the bitrate cuts; 0 = only at the floor */
-    double ladder_jump;                /* output at or above this x the target: every stage expected to be needed at
-                                        * once (overshoot control: the bitrate straight to the floor too); 0 = off */
 } preset_t;
 
 /* the small qbytes_min keeps a near-idle link from looking congested: modem_link floors the rate at 0.5 Mbit/s,
  * so a 3 KB burst alone already reads as 50 ms */
 static const preset_t PRESETS[] = {
-    /*               max     congested       aim          cut           clear     raise            standing  ladder  jump */
-    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075,     10, 3,    2000,   2.0 }, /* ~3 %/s */
-    { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125,     20, 5,    0,      0 },   /* ~5 %/s */
-    { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10,   0,      0 },   /* ~8 %/s */
+    /*               max     congested       aim          cut           clear     raise            standing  ladder */
+    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075,     10, 3,    2000 }, /* ~3 %/s */
+    { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125,     20, 5,    0 },    /* ~5 %/s */
+    { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10,   0 },    /* ~8 %/s */
 };
+
+/* ---- overshoot / recovery algorithms (ALINK_ALGO, control port algo=<name>): to compare in flight */
+enum { UP_STEP, UP_COARSE, UP_ALL };
+typedef struct {
+    const char *name;
+    int link_aware; /* with modem stats and a clear link an overshoot below OS_CLEAR x the floor is left alone; else
+                     * (and when struggling, or without stats) reacted to at ALINK_BITRATE_OVERSHOOT_MAX */
+    double jump;    /* output at or above this x the target (where reacted to at the max): the bitrate straight to the
+                     * floor and every stage of the ladder expected to be needed at once; 0 = one stage per measurement */
+    int up;         /* the way back: UP_STEP every frame-rate step (60 40 30 20 15 12 10), UP_COARSE half then full,
+                     * UP_ALL frame rate and ISP stage back at once */
+    double gap;     /* s between stages back up (doubled up to FD_UP_MAX after one that had to be undone) */
+    int gray_last;  /* the ISP stage (grayscale) goes last, after the full frame rate; else at half */
+    int fit;        /* UP_STEP: a stage skips the steps the output, scaled by the frame rate, still fits */
+    int follow;     /* with modem stats: before each stage the target follows the output up (commit b5e0f9d) */
+    int snap;       /* with modem stats: once the ladder is back the bitrate goes straight back to where overshoot
+                     * control cut it from, not in the link's probing steps (a congestion cut cancels it) */
+} algo_t;
+
+static const algo_t ALGOS[] = {
+    /* name                link jump  up         gap  gray fit follow snap */
+    { "classic",           0,   0,    UP_STEP,   3.0, 0,   0,  1,     0 }, /* as before 2026-11-08 */
+    { "jump",              0,   2.0,  UP_STEP,   3.0, 0,   1,  1,     0 }, /* + everything at once at 2x */
+    { "link",              1,   2.0,  UP_STEP,   3.0, 0,   1,  0,     0 }, /* + only when the link struggles */
+    { "link_fast",         1,   2.0,  UP_STEP,   1.5, 0,   1,  0,     1 },
+    { "link_coarse",       1,   2.0,  UP_COARSE, 2.0, 0,   0,  0,     1 }, /* 10 -> 30, color, 60 */
+    { "link_gray_last",    1,   2.0,  UP_STEP,   1.5, 1,   1,  0,     1 }, /* frames up in grayscale, color last */
+    { "link_gray_coarse",  1,   2.0,  UP_COARSE, 2.0, 1,   0,  0,     1 }, /* 10 -> 30 -> 60 grayscale, color */
+    { "link_snap",         1,   2.0,  UP_ALL,    2.0, 0,   0,  0,     1 }, /* all back at once, retry later if not */
+};
+
+static const algo_t *algo_find(const char *name)
+{
+    char *end;
+    long i = strtol(name, &end, 10); /* by name or number (1..8) */
+    if (end != name && !*end && i >= 1 && i <= (long)(sizeof(ALGOS) / sizeof(ALGOS[0])))
+        return &ALGOS[i - 1];
+    for (size_t k = 0; k < sizeof(ALGOS) / sizeof(ALGOS[0]); k++)
+        if (!strcmp(ALGOS[k].name, name))
+            return &ALGOS[k];
+    return NULL;
+}
 
 /* frame-rate steps, highest first: even decimations of the full rate (60: 60 40 30 20 15 12 10) */
 #define FD_NSTEPS 7
@@ -226,6 +270,7 @@ typedef struct {
     int isp[ISP_N];   /* ALINK_ISP_DESPIKE / _SHARPNESS / _GRAYSCALE, -1 = leave alone */
     double os_max;    /* ALINK_BITRATE_OVERSHOOT_MAX */
     char iface[32];   /* "auto": the route to waybeam's outgoing.server */
+    char algo[32];    /* ALINK_ALGO */
     char temp_profile[128];
 } conf_t;
 
@@ -245,6 +290,7 @@ static void conf_read(conf_t *c)
     for (int i = 0; i < ISP_N; i++)
         c->isp[i] = -1;
     snprintf(c->iface, sizeof(c->iface), "auto");
+    snprintf(c->algo, sizeof(c->algo), "link");
     snprintf(c->temp_profile, sizeof(c->temp_profile), "/etc/temp_profile.conf");
     FILE *f = fopen(MASINA_CONF, "r");
     if (f) {
@@ -261,6 +307,7 @@ static void conf_read(conf_t *c)
             sscanf(buf, "ALINK_LADDER_FROM=%ld", &c->ladder_from);
             sscanf(buf, "ALINK_MIN_FPS=%d", &c->min_fps);
             sscanf(buf, "ALINK_IFACE=%31s", c->iface);
+            sscanf(buf, "ALINK_ALGO=%31s", c->algo);
             if (sscanf(buf, "ALINK_THERMAL=%15s", on) == 1 && truthy(on) >= 0)
                 c->thermal = truthy(on);
             sscanf(buf, "ALINK_TEMP_PROFILE=%127s", c->temp_profile);
@@ -470,6 +517,8 @@ typedef struct {
     double up_wait, last_up, last_down; /* the ladder: s between steps back up, and when it last went up / down */
     int os_control;       /* overshoot control on (ALINK_BITRATE_OVERSHOOT_CONTROL, control port) */
     int strained;         /* the last stats line: the link not clear (a standing queue building) or congested */
+    const algo_t *al;     /* overshoot / recovery algorithm (ALINK_ALGO, control port) */
+    long os_from;         /* kbit/s overshoot control cut the bitrate from, for algo snap; 0 none */
     double os_max;        /* its threshold (ALINK_BITRATE_OVERSHOOT_MAX, control port) */
     int isp[ISP_N];       /* ISP settings kept on the camera (ALINK_ISP_*, control port), -1 = left alone */
     int isp_floor;        /* the floor's ISP stage is on: ISP_FLOOR is kept instead of isp[] */
@@ -508,7 +557,8 @@ static size_t status_core(const alink_t *a, char *o, size_t size)
     if (a->temp >= 0 && n < size)
         n += snprintf(o + n, size - n, ";temp=%dC;therm_fps=%d", a->temp, a->therm_fps);
     if (n < size)
-        n += snprintf(o + n, size - n, ";overshoot_control=%d;overshoot_max=%.2f", a->os_control, a->os_max);
+        n += snprintf(o + n, size - n, ";overshoot_control=%d;overshoot_max=%.2f;algo=%s", a->os_control, a->os_max,
+                      a->al->name);
     for (int i = 0; i < ISP_N && n < size; i++)
         n += snprintf(o + n, size - n, ";%s=%d", ISP_KEYS[i].ctl, a->isp[i]);
     if (n < size)
@@ -569,6 +619,7 @@ static int camera_sync(alink_t *a, const conf_t *c)
     if (labs(b - a->current) > a->current / 50) {
         long prev = a->current;
         a->current = a->manual = b;
+        a->os_from = 0;
         a->clear_since = -1;
         report(a, "external", prev, NULL);
         return 1;
@@ -827,7 +878,7 @@ static int degraded(const alink_t *a) { return a->fps_cap < a->fps_full || a->is
 static void up_pace(alink_t *a, double t)
 {
     if (t - a->last_down >= FD_UP_CALM)
-        a->up_wait = FD_UP_GAP;
+        a->up_wait = a->al->gap;
 }
 
 /* a step down: if it undoes the last step up, the wait before the next one doubles (once per step up) */
@@ -845,7 +896,7 @@ static void stepped_down(alink_t *a, double t)
 /* with the bitrate at its floor (congested, or overshoot control): while the output is still above the target, the next
  * stage of the ladder: frame rate to half, then the ISP stage, then the frame rate lower (the step expected to fit,
  * not below ALINK_MIN_FPS) */
-static void floor_frames(alink_t *a, const conf_t *c, double t, int wait_bitrate)
+static void floor_frames(alink_t *a, const conf_t *c, double t, int wait_bitrate, int may_jump)
 {
     if (a->actual < 0 || t - a->fd_last_change < FD_WINDOW + FD_SETTLE ||
         (wait_bitrate && t - a->last_change < FD_WINDOW + FD_SETTLE))
@@ -854,7 +905,7 @@ static void floor_frames(alink_t *a, const conf_t *c, double t, int wait_bitrate
     if (r < FD_OVER)
         return;
     stepped_down(a, t);
-    if (a->p->ladder_jump > 0 && r >= a->p->ladder_jump) {
+    if (may_jump && a->al->jump > 0 && r >= a->al->jump) {
         /* far over (a dark scene: 5-10x): every stage expected to be needed in one step, not one per measurement */
         double rr = r;
         int base = a->fps, half = half_fps(a, c), cap = a->fps_cap, isp = a->isp_floor;
@@ -919,10 +970,6 @@ static void frames_up(alink_t *a, const conf_t *c, double t);
 static void overshoot_control(alink_t *a, const conf_t *c, double t)
 {
     const double settle = FD_WINDOW + FD_SETTLE;
-    if (a->stats_ok && !a->strained) {
-        a->os_ok_since = -1; /* modem stats and a clear link: it carries the overshoot, nothing to do */
-        return;
-    }
     if (a->actual < 0 || t - a->last_change < settle || t - a->fd_last_change < settle)
         return; /* the window still holds frames from before the last change */
     double r = a->actual / (a->current * 1.024); /* video0.bitrate is in units of 1024 bit/s */
@@ -936,20 +983,30 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
             a->last_change = t;
         return;
     }
-    if (r >= a->os_max) {
+    /* how much overshoot is too much: with modem stats and a clear link the link carries it, only an output at
+     * OS_CLEAR x the floor or more is lowered (8x at the floor, 2x at 4000 kbit/s), step by step. With the link
+     * struggling (or no stats to tell, or an algorithm that is not link_aware) the set max, and far over that (the
+     * algorithm's jump) everything at once */
+    int strain = !a->stats_ok || a->strained || !a->al->link_aware;
+    double over = a->os_max;
+    if (!strain && OS_CLEAR * clamp(a, c, 0) / a->current > over)
+        over = OS_CLEAR * clamp(a, c, 0) / a->current;
+    if (r >= over) {
         a->os_ok_since = -1;
+        int jump = strain && a->al->jump > 0 && r >= a->al->jump;
         if (a->current > clamp(a, c, 0)) {
+            if (a->current > a->os_from)
+                a->os_from = a->current; /* where to snap back to (algo snap) */
             /* straight to where it should fit (clamped to the floor): one step, then the frame rate if needed. Far
-             * over (the preset's ladder_jump): straight to the floor, and the ladder in the same step */
-            int jump = a->p->ladder_jump > 0 && r >= a->p->ladder_jump;
+             * over with the link struggling: straight to the floor, and the ladder in the same step */
             if (apply(a, c, jump ? clamp(a, c, 0) : (long)(a->current / r), "overshoot", NULL)) {
                 a->last_change = t;
                 stepped_down(a, t); /* (a bitrate raised back too early: the next try waits longer) */
             }
             if ((a->current > clamp(a, c, 0) || jump) && a->current <= ladder_from(a, c))
-                floor_frames(a, c, t, 0); /* aggressive preset: the ladder already, alongside the cut */
+                floor_frames(a, c, t, 0, jump); /* aggressive preset: the ladder already, alongside the cut */
         } else
-            floor_frames(a, c, t, 1);
+            floor_frames(a, c, t, 1, jump);
         return;
     }
     if (a->stats_ok) /* modem stats: the link decides when to go back up (control) */
@@ -974,38 +1031,52 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
     }
 }
 
-/* link clear: one stage of the floor's ladder back (before the bitrate goes up): the frame rate up to half, the ISP
- * settings back, then the frame rate up to full. A frame-rate stage goes to the highest step the output, scaled by the
- * frame rate, still fits at FD_AIM of the target, at least the next step (skips steps only where the encoder sends
- * well below the target: a static scene at a low target; at 4000 kbit/s it fills the target even on a white wall) */
+/* link clear: one stage of the floor's ladder back (before the bitrate goes up), as the algorithm says: by default
+ * the frame rate up to half, the ISP settings back, then the frame rate up to full; gray_last keeps the ISP stage until
+ * the full frame rate; UP_COARSE goes to half and full in one stage each, UP_ALL brings everything back at once. With
+ * fit a frame-rate stage goes to the highest step the output, scaled by the frame rate, still fits at FD_AIM of the
+ * target, at least the next step (skips steps only where the encoder sends well below the target) */
 static void frames_up(alink_t *a, const conf_t *c, double t)
 {
+    const algo_t *al = a->al;
     a->fd_last_change = a->last_up = t;
-    int half = half_fps(a, c);
-    if (a->isp_floor && a->fps_cap >= half) {
+    int half = half_fps(a, c), full = a->fps_full;
+    if (al->up == UP_ALL) {
+        a->fps_cap = full;
+        if (a->isp_floor)
+            isp_floor(a, c, t, 0);
+        fps_update_r(a, c, "recover_fps");
+        return;
+    }
+    if (a->isp_floor && a->fps_cap >= (al->gray_last ? full : half)) {
         isp_floor(a, c, t, 0);
         return;
     }
-    int up = a->fps_full;
-    for (int i = FD_NSTEPS - 1; i >= 0; i--)
-        if (fd_step(a->fps_full, i) > a->fps_cap) {
-            up = fd_step(a->fps_full, i);
-            break;
-        }
-    if (a->actual >= 0 && a->current > 0 && a->fps > 0) {
-        /* (a keyframe per second whatever the rate: the output grows less than the frame rate, this errs low) */
-        double r = a->actual / (a->current * 1.024);
-        for (int i = 0; i < FD_NSTEPS; i++) {
-            int st = fd_step(a->fps_full, i);
-            if (st <= up)
+    int up = full;
+    if (al->up == UP_COARSE) {
+        if (a->fps_cap < half)
+            up = half;
+    } else {
+        for (int i = FD_NSTEPS - 1; i >= 0; i--)
+            if (fd_step(full, i) > a->fps_cap) {
+                up = fd_step(full, i);
                 break;
-            if (r * st / a->fps <= FD_AIM) {
-                up = st;
-                break;
+            }
+        if (al->fit && a->actual >= 0 && a->current > 0 && a->fps > 0) {
+            /* (a keyframe per second whatever the rate: the output grows less than the frame rate, this errs low) */
+            double r = a->actual / (a->current * 1.024);
+            for (int i = 0; i < FD_NSTEPS; i++) {
+                int st = fd_step(full, i);
+                if (st <= up)
+                    break;
+                if (r * st / a->fps <= FD_AIM) {
+                    up = st;
+                    break;
+                }
             }
         }
     }
-    if (a->isp_floor && up > half)
+    if (a->isp_floor && !al->gray_last && up > half)
         up = half; /* the ISP stage goes before the frame rate passes half */
     a->fps_cap = up;
     fps_update_r(a, c, "recover_fps");
@@ -1128,26 +1199,41 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
         if (target < a->current * p->cut_floor)
             target = a->current * p->cut_floor;
         if (cut && !grace && t - a->last_change >= MIN_GAP) {
-            if (apply(a, c, (long)target, "congestion", l))
+            if (apply(a, c, (long)target, "congestion", l)) {
                 a->last_change = t;
+                a->os_from = 0; /* the link sets the bitrate now, no snapping back past it */
+            }
             else if (a->current <= clamp(a, c, 0))
-                floor_frames(a, c, t, 1); /* the bitrate is at its floor: the ladder is next */
+                floor_frames(a, c, t, 1, 1); /* the bitrate is at its floor: the ladder is next */
         }
         if (cut && !grace && a->current > clamp(a, c, 0) && a->current <= ladder_from(a, c))
-            floor_frames(a, c, t, 0); /* aggressive preset: the ladder already, alongside the cuts */
+            floor_frames(a, c, t, 0, 1); /* aggressive preset: the ladder already, alongside the cuts */
     } else if (clear) {
         if (a->clear_since < 0)
             a->clear_since = t;
         up_pace(a, t);
         if (!hold_up && degraded(a) && t - a->clear_since >= p->up_after) {
-            if (a->actual >= 0 && a->actual > a->current * 1.024 * FD_OVER && a->current < p->max_bitrate &&
-                t - a->last_change >= MIN_GAP && t - a->fd_last_change >= FD_WINDOW + FD_SETTLE) {
-                /* the camera sends more than the target and the link is clear with it: the target follows the output
-                 * first (adds no traffic), so the next stage is not an overshoot of a target the scene cannot meet */
+            /* frames first, the bitrate once they are all back. (A stage up above the floor's target is no overshoot
+             * on a clear link with link_aware: overshoot control only reacts there at OS_CLEAR x the floor) */
+            if (a->al->follow && a->actual >= 0 && a->actual > a->current * 1.024 * FD_OVER &&
+                a->current < p->max_bitrate && t - a->last_change >= MIN_GAP &&
+                t - a->fd_last_change >= FD_WINDOW + FD_SETTLE) {
+                /* follow: the target up to what the camera sends (the link is clear with it, adds no traffic), so the
+                 * next stage is not an overshoot of a target the scene cannot meet */
                 if (apply(a, c, (long)(a->actual / 1.024), "recover", l))
                     a->last_change = t;
             } else if (t - a->fd_last_change >= a->up_wait)
-                frames_up(a, c, t); /* frames first, the bitrate once they are all back */
+                frames_up(a, c, t);
+        } else if (!hold_up && a->al->snap && a->os_from > a->current && t - a->clear_since >= p->up_after &&
+                   t - a->fd_last_change >= a->up_wait && t - a->last_change >= a->up_wait) {
+            /* snap: the ladder is back, the bitrate straight back to where overshoot control cut it from */
+            long to = a->os_from;
+            a->os_from = 0;
+            if (apply(a, c, to, "recover", l))
+                a->last_change = a->last_up = t;
+        } else if (t - a->fd_last_change < a->up_wait) {
+            /* the ladder just changed: measured first, the bitrate after it (also the jump back to what the link
+             * carried while congested, which a dark scene's burst makes the full max) */
         } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP &&
                    a->os_control && a->actual >= 0 && a->actual >= a->current * 1.024 * a->os_max * OS_BACK) {
             /* with overshoot control and the output near the max: no step, it would just overshoot again, but the
@@ -1313,6 +1399,15 @@ static int command(alink_t *a, const conf_t *c, char *q)
                 a->os_max = x < 1.05 ? 1.05 : x;
                 report(a, "overshoot_max", a->current, NULL);
             }
+        } else if (!strcmp(tok, "algo")) {
+            const algo_t *al = algo_find(v);
+            if (!al) {
+                ok = 0;
+            } else if (al != a->al) {
+                a->al = al;
+                a->up_wait = al->gap;
+                report(a, "algo", a->current, NULL);
+            }
         } else if (!strcmp(tok, "preset")) {
             const preset_t *p = preset_find(v);
             if (!p) {
@@ -1407,7 +1502,7 @@ int main(int argc, char **argv)
     conf_read(&c);
     static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9,
                          .actual = -1, .fd_last_change = -1e9, .temp = -1, .therm_level = -1, .os_ok_since = -1,
-                         .up_wait = FD_UP_GAP, .last_up = -1e9, .last_down = -1e9 };
+                         .last_up = -1e9, .last_down = -1e9 };
     const char *name = argc > 1 ? argv[1] : c.preset;
     if (!(a.p = preset_find(name))) {
         fprintf(stderr, "unknown preset %s (performance, balanced, quality), using balanced\n", name);
@@ -1416,6 +1511,11 @@ int main(int argc, char **argv)
     a.enabled = c.enabled;
     a.os_control = c.os_control;
     a.os_max = c.os_max;
+    if (!(a.al = algo_find(c.algo))) {
+        fprintf(stderr, "unknown ALINK_ALGO %s, using link\n", c.algo);
+        a.al = algo_find("link");
+    }
+    a.up_wait = a.al->gap;
     memcpy(a.isp, c.isp, sizeof(a.isp));
     udp_open(c.ground_ip);
 
