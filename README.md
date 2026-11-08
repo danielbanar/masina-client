@@ -31,54 +31,72 @@ modem_link --(stats lines, UDP 127.0.0.1:2225)--> modem_alink --(HTTP API)--> wa
                                                        +<-- control port 2226 (HTTP/UDP): enable, preset, ...
 ```
 
-modem_alink decides on every stats line from modem_link (every 0.25 s).
+Two loops, each with one job:
 
-**1. Congestion -> bitrate.** Congestion is a *standing* uplink queue in the modem (`qdelay_min` / `ul_buf_min`,
-the smallest queue of the interval): a queue that never empties means the link carries less than is sent.
-Keyframes only make short spikes that drain within the interval, so they don't count.
+```
+link loop (every modem_link line, 0.25 s)          overshoot loop (every output measurement, 0.25 s)
+  modem stats -> target                              target (read only) + measured output
+  only it writes the target                         -> encoder bitrate (never above the target)
+                                                     -> at the encoder's floor: the ladder (frame rate, ISP)
+```
+
+The **target** is what the link should carry, e.g. 4000 kbit/s. The overshoot loop never changes it; it only moves
+the encoder bitrate and the ladder so that what the camera actually sends stays within it. A dark scene that makes the
+encoder send 5x its bitrate lowers the encoder and the frame rate, not the target.
+
+**1. Link loop: congestion -> target.** Congestion is a *standing* uplink queue in the modem (`qdelay_min` /
+`ul_buf_min`, the smallest queue of the interval): a queue that never empties means the link carries less than is
+sent. Keyframes only make short spikes that drain within the interval, so they don't count.
 
 - *congested*: aim for a share of what the uplink carried, minus enough to empty the queue within `drain` s; while
-  the bitrate is above that, cut to it (at least to `down_factor`, at most to `cut_floor` of it per line). Below it:
-  hold, the queue is draining.
+  the target is above that, cut it (at least to `down_factor`, at most to `cut_floor` of it per line). Below it:
+  hold, the queue is draining. The encoder follows a cut at once where it is above the new target.
 - *clear*: after `up_after` s clear, go back to `ul_share` of what the uplink carried while congested (if that was
-  within the last 10 s), then raise a small step per line up to the preset's max.
+  within the last 10 s), then raise a small step per line up to the preset's max, **but only while the output fills
+  at least `ALINK_PROBE_FILL` of the target** (default 0.8 = 80 %): a clear link says nothing about more than it is
+  sent. A static scene sending 1500 leaves the target at ~1850 instead of letting it climb untested to the max.
+  `ALINK_PROBE_FILL=0` raises it on a clear link whatever the output (as before the two loops). Where the encoder was
+  at the target (and the ladder off) it follows the target up.
 - the network's own rules (modem_link's trigger fields) refine this: *edge* (a handover/release rule within 2 dB of
   firing) = no raising; *handover* = no cuts for 1 s after the cell changes; *no service* = no raising.
 
-**2. Bitrate floor -> the ladder.** The bitrate never goes below `ALINK_ENC_MIN` (1000 kbit/s: waybeam does not
-encode below that; checked in the encoder driver, `/proc/mi_modules/mi_venc/mi_venc0`: targets of 900, 700, 500, 300
-and 100 all run at MaxBitrate 1024000). The encoder always gets the target; what it actually sends is normally not looked at. Only when
-the link is **congested and the bitrate is already at the floor**, modem_alink measures the real output and, while it
-is above the target, makes the picture cheaper one stage at a time (~1.3 s apart, each measured before the next):
+Without modem stats (bench, or `modem_link` not running) the target stays where it was; at start that is the bitrate
+the camera had (or the preset's max, if lower). The bitrate slider (any change from someone else) sets the target.
 
-```
-bitrate -> floor  ->  frame rate to 30 (half)  ->  ISP stage  ->  frame rate lower (20, 15, 12, 10)
-                                                    despike 15     the step expected to fit,
-                                                    sharpness 0    never below ALINK_MIN_FPS (default 15)
-                                                    grayscale
-```
+**2. Overshoot loop: output vs target -> encoder bitrate, then the ladder.** The output is measured every 0.25 s over
+1 s (see below); after any change the loop waits 1.25 s so the window holds only frames from after it.
+
+- **down**, the output at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5; while the link is
+  congested anything above the target): the encoder bitrate by the overshoot, so the output should land at the target.
+  At the encoder's floor (`ALINK_ENC_MIN`, 1000 kbit/s: waybeam does not encode below that; checked in the encoder
+  driver, `/proc/mi_modules/mi_venc/mi_venc0`: targets of 900 ... 100 all run at MaxBitrate 1024000), one stage of
+  the ladder per measurement:
+
+  ```
+  encoder -> floor  ->  frame rate to 40 (2/3)  ->  ISP stage  ->  frame rate lower (30, 20, 15, 12, 10)
+                                                     despike 15     one step at a time,
+                                                     sharpness 0    never below ALINK_MIN_FPS (default 15)
+                                                     grayscale
+  ```
+
+  Far over (the algorithm's `jump`, e.g. 2x the target): the encoder straight to its floor and every stage expected
+  to be needed, in one step. The **performance** preset already takes a stage alongside once the encoder is at or below
+  2000 kbit/s (`ALINK_LADDER_FROM=<kbit/s>` overrides it for any preset, 0 = only at the floor).
+- **up**, the output below 0.8 x the target for the algorithm's hold (default the preset's `up_after`, 3 s) and the
+  link not struggling: the ladder back first (frame rate up to 40, the ISP settings back, frame rate up to full), then
+  the encoder bitrate to where the output should fill the target, never above it. A ladder stage also comes back when
+  the encoder is above its floor and sends no more than its bitrate: the ladder is only there for an encoder at its
+  floor that sends more than it is told. Steps up are the algorithm's gap apart; one that has to be undone doubles the
+  gap (up to 60 s), 20 s without a step down brings it back, so it does not bounce. A frame-rate step up goes to the
+  highest rate the output, scaled by the frame rate, still fits at 90 % of the target (algorithms with `fit`).
+
+With `ALINK_BITRATE_OVERSHOOT_CONTROL=false` the encoder bitrate is the target, and the ladder only runs while the
+link is congested with the target at the floor (and comes back once the encoder holds the output again).
 
 The ISP stage keeps the camera's own despike/sharpness/grayscale values first and puts them back afterwards (or the
 `ALINK_ISP_*` values, if set). A dark (high-gain) or very detailed, moving scene can need far more than 1000 kbit/s
-at 60 fps even at the coarsest quantizer. Measured, dark scene at 1440p60 with overshoot control (see 4.), target
-4000: 0 s bitrate 4000 -> 1000, 1.4 s 30 fps, 2.7 s ISP stage, 3.9 s 15 fps: output ~21 -> ~2 Mbit/s.
-
-**3. Recovery.** When the link is clear again, the same way back: frame rate up to 30, the ISP settings back, frame
-rate up to full, and only then the bitrate. A stage up that sends more than the floor's target is not undone as an
-overshoot while the link is clear: overshoot control only reacts there at 8x the floor (see 4.).
-
-The **performance** preset is more aggressive: its ladder already starts once the bitrate is at or below 2000 kbit/s,
-alongside the cuts (e.g. congested: 4000 -> 1860 kbit/s and 30 fps at once, where balanced goes 4000 -> 2280 at
-60 fps). `ALINK_LADDER_FROM=<kbit/s>` overrides it for any preset (0 = only at the floor). One step every 3 s; a step up that has to be undone soon after doubles
-the wait (up to 60 s), 20 s without a step down brings it back to 3 s, so it does not bounce. A frame-rate step up goes
-to the highest rate the output, scaled by the frame rate, still fits at 90 % of the target, at least the next step
-(this only skips steps where the encoder sends well below the target, e.g. a static scene at a low target; at
-4000 kbit/s it fills the target even on a white wall, and goes one step at a time).
-
-Measured on the bench without modem stats (overshoot control, performance, `ALINK_ENC_MIN=1000`): dark room -> 1000
-kbit/s, 10 fps, ISP stage in ~4 s; then a static white wall: 30 fps 3 s after the output drops (10 -> 30 in one step,
-the output was ~150 kbit/s), ISP settings back, 40, 60 fps, then 4000 kbit/s, all back ~15 s after. It used to take
-~135 s (with `ALINK_ENC_MIN=100`: the ladder, then the bitrate from 100 kbit/s in 10 % steps every 3 s).
+at 60 fps even at the coarsest quantizer. Measured with the earlier single-loop version, dark scene at 1440p60,
+target 4000: 0 s bitrate 4000 -> 1000, 1.4 s 30 fps, 2.7 s ISP stage, 3.9 s 15 fps: output ~21 -> ~2 Mbit/s.
 
 **Measuring the output.** From the transmit counters (`/sys/class/net/<if>/statistics/tx_bytes`, `tx_packets`) of
 the interface the stream leaves on, minus IP/UDP/RTP headers per packet, averaged over 1 s. The interface is found
@@ -86,55 +104,33 @@ from waybeam's `outgoing.server` and the routing table (`wg0` in flight, `eth0` 
 `ALINK_IFACE`. Matches what the ground receives within ~3 %. Note: waybeam's `video0.bitrate` is in units of
 1024 bit/s.
 
-**4. Optional: bitrate overshoot control** (`ALINK_BITRATE_OVERSHOOT_CONTROL`, off by default). Watches the output:
-at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5) it lowers the bitrate (by the overshoot, in one
-step, not below the floor), and at the floor the ladder of 2. (~1.3 s per stage). The performance preset at 2x the
-target or more goes straight to the floor and takes every stage expected to be needed at once (bench, dark room:
-4000 kbit/s 60 fps -> 1000 kbit/s 10 fps grayscale in one step, ~0.5 s after the output rose, where the stages took
-~4.4 s). With modem stats, how much overshoot is too much depends on the link:
+**3. Algorithms.** **`ALINK_ALGO`** (or `algo=<name|1..8>` on the control port) picks how the overshoot loop moves,
+to compare in flight; the status line shows `algo=`. All react at `ALINK_BITRATE_OVERSHOOT_MAX` (1.5x the target).
 
-| link | output vs target | reaction |
-|---|---|---|
-| clear | below 8x the floor (8000 kbit/s at the 1000 floor: 8x at the floor, 4x at 2000, 2x at 4000; never below 1.5x) | none, the link carries it |
-| clear | 8x the floor and more | lowered step by step (bitrate, then one stage of the ladder per measurement) |
-| struggling (standing queue at or above the preset's clear thresholds, e.g. performance 3 ms with 5 KB, or congested) | `ALINK_BITRATE_OVERSHOOT_MAX` (1.5x) and more | lowered step by step |
-| struggling | 2x and more (algorithm `link`) | everything at once |
+| # | `ALINK_ALGO` | target from | down | back up (from 15 fps grayscale, g = grayscale) | hold | gap | encoder back up |
+|---|---|---|---|---|---|---|---|
+| 1 | `mid` (default) | link | one step per measurement (~1.3 s), at 2x all at once | 20g 30g 40g, color, 60 (fitting steps skipped) | `up_after` | 2 s | one step |
+| 2 | `fast` | link | at the first overshoot: floor and every stage expected, at once | 60 and color at once | 1 s | 1 s | one step |
+| 3 | `slow` | link | one step at least 3 s apart, never all at once | 20g 30g 40g, color, 60, one step each | 8 s | 5 s | +25 % per step |
+| 4 | `coarse` | link | as mid | 40g, color, 60 | `up_after` | 2 s | one step |
+| 5 | `gray_last` | link | as mid | 20g ... 60g, then color (fitting steps skipped) | `up_after` | 1.5 s | one step |
+| 6 | `fixed_mid` | set bitrate | as mid | as mid | as mid | 2 s | one step |
+| 7 | `fixed_fast` | set bitrate | as fast | as fast | 1 s | 1 s | one step |
+| 8 | `fixed_slow` | set bitrate | as slow | as slow | 8 s | 5 s | +25 % per step |
 
-This is the default algorithm, `link`. **`ALINK_ALGO`** (or `algo=<name|1..8>` on the control port) switches between
-eight, to compare in flight; the status line shows `algo=`. Without modem stats every algorithm reacts as with the link
-struggling.
+*hold* = how long the output has to stay below 0.8x the target before the first step up. *one step* = the encoder
+straight to where the output should fill the target (at most the target).
 
-| # | `ALINK_ALGO` | reacts | down | back up (from 10 fps grayscale, g = grayscale) | gap | bitrate after |
-|---|---|---|---|---|---|---|
-| 1 | `classic` | always at 1.5x | one stage per measurement | 12g 15g 20g 30g, color, 40, 60; target follows the output before each stage | 3 s | link probing |
-| 2 | `jump` | always at 1.5x | at 2x all at once | as classic, frame-rate steps the output fits skipped | 3 s | link probing |
-| 3 | `link` (default) | clear link: 8x the floor; struggling: 1.5x | at 2x (struggling) all at once | 12g ... 30g, color, 40, 60 (fitting steps skipped) | 3 s | link probing |
-| 4 | `link_fast` | as link | as link | as link | 1.5 s | straight back |
-| 5 | `link_coarse` | as link | as link | 30g, color, 60 | 2 s | straight back |
-| 6 | `link_gray_last` | as link | as link | 12g ... 60g, then color (fitting steps skipped) | 1.5 s | straight back |
-| 7 | `link_gray_coarse` | as link | as link | 30g, 60g, color | 2 s | straight back |
-| 8 | `link_snap` | as link | as link | 60 and color at once | 2 s | straight back |
+**6-8 ignore the link**: the target stays at the bitrate that was set, no congestion cuts, no probing; they run the
+overshoot loop even with `ALINK_BITRATE_OVERSHOOT_CONTROL=false`. A link that congests while the output stays within
+1.5x the target is not reacted to.
 
-"Straight back" (with modem stats): once the ladder is back, the bitrate goes in one step back to where overshoot
-control cut it from (a congestion cut in between cancels it, the link decides then); otherwise the link's probing
-steps (performance: ~20 s from 1000 to 4000 kbit/s). A stage that has to be undone doubles the gap (up to 60 s), 20 s
-without a step down brings it back. The first stage waits for the preset's `up_after` (3 s) of clear link. Measured
-with `link` on the real modem (dark room, then a white wall): 7 stages 3-6 s apart and ~20 s of bitrate probing,
-~45 s in all; the encoder fills the floor's 1000 kbit/s even on a white wall, so skipping fitting steps rarely helps
-there, the gap and coarser stages do.
+Simulated (the real `control()` / overshoot loop against a model scene and link, `mid`, performance): dark room at
+4000 -> 1000 kbit/s, 20 fps grayscale in one step, then 40 fps grayscale (output 3500, within the 4000 target);
+white wall: color, 60 fps, 4000 kbit/s ~7 s after. Link 6000 -> 2500 with a busy scene: target 4000 -> 1000 and
+40 fps, then 60 fps once the target has room, then the encoder, then target and encoder together back to 4000.
 
-Without modem stats (bench, or `modem_link` not running) it reacts as with the link struggling. Real modem, dark
-room: the standing queue jumped to ~216 KB / 92 ms and the one-step cut came on the next stats line, ~0.5 s after
-the queue started building. Without
-modem stats it also recovers on its own: below 0.8 x the max for `up_after` s, the ladder first (frame rate up to
-half, the ISP settings back, frame rate to full), then the bitrate in one step back to the bitrate that was set (never
-above it; the output is below the target already, so a higher target cannot make it overshoot, and there is no link to
-probe). Just after a stage up, an output above the target but not above the set bitrate raises the target to it
-instead of undoing the stage (at the floor's 100 kbit/s almost any stage up would read as an overshoot). With modem stats the link decides when to go back up;
-while the output is still near the max (1.2 x the target at the default 1.5) there are no steps, but the target is
-raised to what the camera sends (a scene that needs more than the target; it adds no traffic).
-
-**5. Thermal throttling.** Every 5 s the SoC temperature (`/sys/devices/virtual/mstar/msys/TEMP_R`) is looked up in
+**4. Thermal throttling.** Every 5 s the SoC temperature (`/sys/devices/virtual/mstar/msys/TEMP_R`) is looked up in
 `/etc/temp_profile.conf` and caps the frame rate. Back up only 2 °C below the hotter band. This wins over everything
 (also `ALINK_MIN_FPS`) and also works while modem_alink is disabled. It replaces the old `thermal-throttle` script,
 which reads the frame rate from `/etc/majestic.yaml` and does nothing under waybeam (disable it:
@@ -149,7 +145,7 @@ which reads the frame rate from `/etc/majestic.yaml` and does nothing under wayb
 ```
 (this is also the built-in default if the file is missing)
 
-**6. Image (ISP) settings.** Optionally modem_alink keeps three ISP settings on the camera: despike
+**5. Image (ISP) settings.** Optionally modem_alink keeps three ISP settings on the camera: despike
 (`nr_despike`, 0..15), sharpness (0..255) and grayscale (`color_to_gray`). waybeam loses them on every start and
 reinit (it reloads the sensor bin), so every 3 s they are read back from `/api/v1/iq` and set again if needed. A key
 that is not set is left alone. In a dark, high-gain scene the picture is mostly noise; measured at 1440p60 (target
@@ -157,10 +153,10 @@ that is not set is left alone. In a dark, high-gain scene the picture is mostly 
 plus grayscale ~2 Mbit/s. They soften the picture, so set them for the conditions you fly in, or switch them over the
 control port. Works while modem_alink is disabled too.
 
-**7. Ownership.** While enabled, modem_alink owns the bitrate: a change from someone else (e.g. the ground station's
-bitrate slider) is where it carries on from. The bitrate and frame rate the camera had when it took over, or the
-last change from someone else, are given back when it is disabled or stops (SIGINT/SIGTERM). No stats for 3 s: the
-bitrate is held. Frame-rate changes use `/api/v1/live/set` (not written to flash).
+**6. Ownership.** While enabled, modem_alink owns the bitrate: a change from someone else (e.g. the ground station's
+bitrate slider) is the new target, where it carries on from. The bitrate and frame rate the camera had when it took
+over, or the last change from someone else, are given back when it is disabled or stops (SIGINT/SIGTERM). No stats
+for 3 s: the target is held. Frame-rate changes use `/api/v1/live/set` (not written to flash).
 
 ### Presets
 
@@ -183,10 +179,11 @@ bitrate is held. Frame-rate changes use `/api/v1/live/set` (not written to flash
 | `ALINK_LADDER_FROM` | the preset's | kbit/s at or below which the ladder starts alongside the cuts (performance 2000, others the floor; 0 = only at the floor) |
 | `ALINK_MIN_FPS` | `15` | lowest frame rate the bitrate-floor logic uses |
 | `ALINK_IFACE` | `auto` | interface to measure the output on; `auto` = route to waybeam's `outgoing.server` |
-| `ALINK_BITRATE_OVERSHOOT_CONTROL` | `false` | watch the output all the time (see 4.) |
-| `ALINK_BITRATE_OVERSHOOT_MAX` | `1.5` | output/target that triggers it (not below 1.05) |
-| `ALINK_ALGO` | `link` | overshoot / recovery algorithm, name or 1..8 (see 4.) |
-| `ALINK_ISP_DESPIKE` | not set | ISP despike 0..15 kept on the camera (see 6.) |
+| `ALINK_BITRATE_OVERSHOOT_CONTROL` | `false` | the overshoot loop moves the encoder bitrate (see 2.); `false` = the encoder bitrate is the target |
+| `ALINK_BITRATE_OVERSHOOT_MAX` | `1.5` | output/target at which the overshoot loop steps down (not below 1.05) |
+| `ALINK_ALGO` | `mid` | overshoot loop algorithm, name or 1..8 (see 3.) |
+| `ALINK_PROBE_FILL` | `0.8` | the link loop raises the target only while the output is at least this share of it; `0` = whatever the output (see 1.) |
+| `ALINK_ISP_DESPIKE` | not set | ISP despike 0..15 kept on the camera (see 5.) |
 | `ALINK_ISP_SHARPNESS` | not set | ISP sharpness 0..255 kept on the camera |
 | `ALINK_ISP_GRAYSCALE` | not set | `true` / `false`: grayscale kept on the camera |
 | `ALINK_THERMAL` | `true` | thermal throttling |
@@ -202,7 +199,9 @@ separated by `&` or `;`. No query = status only. A bad key or value answers `err
 |---|---|
 | `enable` | `0` / `1` |
 | `preset` | `performance` / `balanced` / `quality` |
-| `bitrate_overshoot_control` | `0` / `1` (turning it off gives back the frames and bitrate it held down) |
+| `bitrate_overshoot_control` | `0` / `1` (turning it off gives back the frames it held down, the encoder bitrate goes to the target) |
+| `algo` | name or `1`..`8` (see 3.) |
+| `probe_fill` | `0`..`1`, e.g. `0` = raise the target on a clear link whatever the output (see 1.) |
 | `bitrate_overshoot_max` | e.g. `1.8` |
 | `isp_despike` | `0`..`15`, `-1` = stop managing it (the value stays until waybeam restarts) |
 | `isp_sharpness` | `0`..`255`, `-1` = stop managing it |
@@ -219,41 +218,45 @@ echo 'preset=quality;enable=1' | nc -u -w1 <drone> 2226
 ### Status and reports
 
 ```
-ALINK;time=00:51:46;enabled=1;preset=balanced;bitrate=3000kbps;max=8000kbps;fps=60;actual=2950kbps;fps_cap=60;
+ALINK;time=00:51:46;enabled=1;preset=balanced;bitrate=3000kbps;target=3000kbps;max=8000kbps;fps=60;actual=2950kbps;fps_cap=60;
       temp=44C;therm_fps=0;overshoot_control=0;overshoot_max=1.50;manual=3000kbps
 ```
 
 | Field | |
 |---|---|
-| `bitrate` | target given to the encoder |
+| `bitrate` | encoder bitrate (the overshoot loop's) |
+| `target` | what the link should carry (the link loop's); the encoder never goes above it |
 | `max` | preset's max |
 | `fps` | frame rate the camera runs |
 | `actual` | measured output, kbit/s over 1 s (once the interface is known) |
 | `fps_cap` | frame rate allowed by the bitrate-floor / overshoot logic |
 | `isp_floor` | 1 = the ladder's ISP stage is on (despike 15, sharpness 0, grayscale) |
 | `temp`, `therm_fps` | SoC temperature and the thermal frame-rate cap (0 = none) |
-| `overshoot_control`, `overshoot_max` | current overshoot-control settings |
+| `overshoot_control`, `overshoot_max`, `algo` | current overshoot loop settings |
+| `probe_fill` | output/target the link loop needs before raising the target (0 = none) |
 | `isp_despike`, `isp_sharpness`, `isp_grayscale` | ISP settings kept on the camera (-1 = left alone) |
 | `manual` | bitrate given back on disable/exit (status reply only) |
 
-Every change is printed and sent to `GROUND_IP:2224` with `prev=` and `reason=`, plus the link fields (`qdelay`,
+Every change is printed and sent to `GROUND_IP:2224` with `prev=` (the encoder bitrate before, or for a target change
+that the encoder did not follow, the target before) and `reason=`, plus the link fields (`qdelay`,
 `queue`, `ul_rate`, `qdelay_min`, `queue_min`, `trigger`, `trigger_gap`) when it came from a stats line. Reasons:
 
 | reason | |
 |---|---|
 | `start`, `enable`, `disable`, `exit` | modem_alink took over / gave the camera back |
-| `congestion`, `recover`, `max` | bitrate cut / raised / clamped to the preset's max |
-| `external` | someone else changed the bitrate; carried on from there |
-| `floor_fps`, `recover_fps` | frame rate lowered at the bitrate floor / raised again |
+| `congestion`, `recover`, `max` | target cut / raised / clamped to the preset's max (link loop) |
+| `overshoot`, `fill` | encoder bitrate lowered / raised by the overshoot loop |
+| `target` | encoder bitrate brought to the target (above it, or overshoot control off) |
+| `external` | someone else changed the bitrate; it is the new target |
+| `floor_fps`, `recover_fps` | frame rate lowered at the encoder floor / raised again |
 | `floor_isp`, `recover_isp` | the ladder's ISP stage on / off |
-| `overshoot` | bitrate cut by overshoot control |
-| `overshoot_control_on`, `overshoot_control_off`, `overshoot_max` | changed on the control port |
+| `overshoot_control_on`, `overshoot_control_off`, `overshoot_max`, `algo`, `probe_fill` | changed on the control port |
 | `thermal` | thermal frame-rate cap changed |
 | `isp` | ISP settings (re)applied, e.g. after waybeam restarted |
 | `fps` | frame rate set back (e.g. after a cap was lifted) |
 | `preset` | preset changed |
 | `edge`, `handover`, `no_service`, `service` | network events from modem_link |
-| `no_data` | no stats for 3 s, bitrate held |
+| `no_data` | no stats for 3 s, target held |
 
 ### waybeam API used
 
@@ -301,5 +304,6 @@ echo "SIM;qdelay=2;ul_buf=0.5;ul_rate=8.00;qdelay_min=1;ul_buf_min=0.2" | socat 
 ```
 
 Send them 4x per second (`while :; do echo ... | socat ...; sleep 0.25; done`). Expected with a detailed scene at
-a 3000 target: congested -> `congestion` 3000 -> 1500 -> 1000, then `floor_fps` (e.g. 15 fps); clear ->
-`recover_fps` 20 -> 30 -> 40 -> 60, then `recover` steps of the bitrate.
+a 3000 target: congested -> `congestion` 3000 -> 1500 -> 1000 (target and encoder), then `floor_fps` (e.g. 40 fps)
+while the output is above the target; clear -> `recover` steps of the target while the output fills it, `recover_fps`
+back to 60 once it has room, then `fill` (encoder) and `recover` (both) up to the max.
