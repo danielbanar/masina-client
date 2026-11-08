@@ -37,9 +37,11 @@
  * always gets the target; what it actually sends is not looked at, except in one case: congested with the bitrate
  * already at that floor. Then the output is measured (transmit counters of the interface the stream leaves on, found
  * from waybeam's outgoing.server and the routing table, or ALINK_IFACE; minus IP/UDP/RTP headers; over FD_WINDOW s),
- * and if it is above the target the frame rate goes down (/api/v1/live/set?video0.fps=) to the step expected to fit
- * (60 40 30 20 15 ..., not below ALINK_MIN_FPS): a detailed scene can need more than the floor at the full frame rate.
- * Recovering, the frame rate goes back up first, a step at a time, and only then the bitrate.
+ * and while it is above the target the picture gets cheaper, one stage per measurement: the frame rate to half (60 ->
+ * 30), then the ISP noise set (despike 15, sharpness 0, grayscale; the camera's own values are kept to put back), then
+ * the frame rate lower, to the step expected to fit (20 15 12 10, not below ALINK_MIN_FPS). A dark, high-gain or very
+ * detailed scene can need far more than the floor at the full frame rate. Recovering goes back the same way: the frame
+ * rate up to half, the ISP settings back, the frame rate to full, and only then the bitrate.
  * ALINK_BITRATE_OVERSHOOT_CONTROL=true also watches the output all the time: at or above ALINK_BITRATE_OVERSHOOT_MAX
  * times the target (default 1.5) the bitrate goes down (by the overshoot, in one step, not below the floor),
  * and at the floor the frame rate, whether the link is congested or not. Without modem stats the way back is its own:
@@ -111,7 +113,9 @@
 #define FD_SAMPLE 0.25    /* s between transmit-counter samples */
 #define FD_WINDOW 1.0     /* s the output is averaged over (a 1 s GOP's keyframe) */
 #define FD_SETTLE 0.25    /* s after a change before a window counts, on top of FD_WINDOW: going down is fast ... */
-#define FD_UP_GAP 3.0     /* ... going back up slow: s between steps up, so it does not bounce */
+#define FD_UP_GAP 3.0     /* ... going back up slow: s between steps up ... */
+#define FD_UP_MAX 60.0    /* ... doubled up to this after a step up that had to be undone (it would only bounce) ... */
+#define FD_UP_CALM 20.0   /* ... and back to FD_UP_GAP after this long without a step down */
 #define FD_OVER 1.05      /* at the floor, output above this share of the target means frames have to go */
 #define FD_AIM 0.90       /* drop to the step expected to give this share of the target */
 #define FD_HDR 40         /* bytes per packet that are not video: IPv4 20 + UDP 8 + RTP 12 (+14 on Ethernet) */
@@ -123,6 +127,7 @@
 #define THERM_MAX 16      /* profile lines */
 #define ISP_EVERY 3.0     /* s between checks that the camera still has the ISP settings */
 #define ISP_N 3           /* managed ISP settings, see ISP_KEYS */
+static const int ISP_FLOOR[ISP_N] = { 15, 0, 1 }; /* the floor's ISP stage: despike 15, sharpness 0, grayscale */
 
 /* ALINK_ISP_* / isp_* (control port) -> /api/v1/iq name and the highest value */
 static const struct { const char *ctl, *iq; int max; } ISP_KEYS[ISP_N] = {
@@ -444,9 +449,12 @@ typedef struct {
     int temp, therm_fps, therm_level; /* degrees C (-1 unknown), thermal frame-rate cap (0 none), profile line */
     double therm_next;
     double os_ok_since;   /* overshoot control: below OS_BACK x max since, -1 not */
+    double up_wait, last_up, last_down; /* the ladder: s between steps back up, and when it last went up / down */
     int os_control;       /* overshoot control on (ALINK_BITRATE_OVERSHOOT_CONTROL, control port) */
     double os_max;        /* its threshold (ALINK_BITRATE_OVERSHOOT_MAX, control port) */
     int isp[ISP_N];       /* ISP settings kept on the camera (ALINK_ISP_*, control port), -1 = left alone */
+    int isp_floor;        /* the floor's ISP stage is on: ISP_FLOOR is kept instead of isp[] */
+    int isp_saved[ISP_N]; /* the camera's values before it, to put back where isp[] is -1 */
     double isp_next;      /* next check */
 } alink_t;
 
@@ -484,6 +492,8 @@ static size_t status_core(const alink_t *a, char *o, size_t size)
         n += snprintf(o + n, size - n, ";overshoot_control=%d;overshoot_max=%.2f", a->os_control, a->os_max);
     for (int i = 0; i < ISP_N && n < size; i++)
         n += snprintf(o + n, size - n, ";%s=%d", ISP_KEYS[i].ctl, a->isp[i]);
+    if (n < size)
+        n += snprintf(o + n, size - n, ";isp_floor=%d", a->isp_floor);
     return n < size ? n : size - 1;
 }
 
@@ -629,6 +639,8 @@ static void camera_attach(alink_t *a, const conf_t *c, const char *reason)
     }
 }
 
+static void isp_floor(alink_t *a, const conf_t *c, double t, int on);
+
 /* gives the camera back what it had when modem_alink took over, or someone else's last change */
 static void release(alink_t *a, const conf_t *c, const char *reason)
 {
@@ -639,6 +651,8 @@ static void release(alink_t *a, const conf_t *c, const char *reason)
     if (a->current != a->manual && camera_set(c, "video0.bitrate", a->manual))
         a->current = a->manual;
     a->fps_cap = a->fps_full;
+    if (a->isp_floor)
+        isp_floor(a, c, now(), 0);
     /* the frame rate goes back too, but not above the thermal cap while alink keeps running */
     int back = strcmp(reason, "exit") && a->therm_fps > 0 && a->therm_fps < a->fps_full ? a->therm_fps : a->fps_full;
     if (a->fps != back && camera_set_live(c, "video0.fps", back))
@@ -772,8 +786,19 @@ static void fd_measure(alink_t *a, const conf_t *c, double t)
     }
 }
 
-/* congested with the bitrate at its floor: if the output is still above the target, fewer frames (the step expected
- * to fit, not below ALINK_MIN_FPS) */
+/* the frame rate of the floor's first stage: half the full rate (60 -> 30), not below ALINK_MIN_FPS */
+static int half_fps(const alink_t *a, const conf_t *c)
+{
+    int h = a->fps_full / 2;
+    return h < c->min_fps ? c->min_fps : h;
+}
+
+/* something of the floor's ladder is on (frame rate or ISP stage): it goes back before the bitrate does */
+static int degraded(const alink_t *a) { return a->fps_cap < a->fps_full || a->isp_floor; }
+
+/* with the bitrate at its floor (congested, or overshoot control): while the output is still above the target, the next
+ * stage of the ladder: frame rate to half, then the ISP stage, then the frame rate lower (the step expected to fit,
+ * not below ALINK_MIN_FPS) */
 static void floor_frames(alink_t *a, const conf_t *c, double t)
 {
     if (a->actual < 0 || t - a->fd_last_change < FD_WINDOW + FD_SETTLE || t - a->last_change < FD_WINDOW + FD_SETTLE)
@@ -781,7 +806,24 @@ static void floor_frames(alink_t *a, const conf_t *c, double t)
     double r = a->actual / (a->current * 1.024); /* video0.bitrate is in units of 1024 bit/s */
     if (r < FD_OVER)
         return;
-    double want = a->fps * FD_AIM / r;
+    if (t - a->last_up < a->up_wait + FD_WINDOW + FD_SETTLE + 1) { /* the last step up did not hold */
+        a->up_wait *= 2;
+        if (a->up_wait > FD_UP_MAX)
+            a->up_wait = FD_UP_MAX;
+    }
+    a->last_down = t;
+    if (a->fps_cap > half_fps(a, c)) { /* 1: half the frames */
+        a->fps_cap = half_fps(a, c);
+        fps_update_r(a, c, "floor_fps");
+        a->fd_last_change = t;
+        return;
+    }
+    if (!a->isp_floor) { /* 2: less noise to encode */
+        isp_floor(a, c, t, 1);
+        a->fd_last_change = t;
+        return;
+    }
+    double want = a->fps * FD_AIM / r; /* 3: fewer frames still */
     int next = -1;
     for (int i = 0; i < FD_NSTEPS; i++) {
         int st = fd_step(a->fps_full, i);
@@ -826,10 +868,10 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
     }
     if (a->os_ok_since < 0)
         a->os_ok_since = t;
-    if (t - a->os_ok_since < a->p->up_after || t - a->fd_last_change < FD_UP_GAP || t - a->last_change < FD_UP_GAP)
+    if (t - a->os_ok_since < a->p->up_after || t - a->fd_last_change < a->up_wait || t - a->last_change < FD_UP_GAP)
         return;
-    if (a->fps_cap < a->fps_full) {
-        frames_up(a, c, t); /* frames first */
+    if (degraded(a)) {
+        frames_up(a, c, t); /* the ladder first */
     } else if (a->current < a->manual) {
         long step = (long)(a->current * OS_UP);
         if (step < UP_MIN_STEP) step = UP_MIN_STEP;
@@ -839,18 +881,28 @@ static void overshoot_control(alink_t *a, const conf_t *c, double t)
     }
 }
 
-/* link clear: the frame rate back up a step (before the bitrate goes up) */
+/* link clear: one stage of the floor's ladder back (before the bitrate goes up): the frame rate up to half, the ISP
+ * settings back, then the frame rate up to full */
 static void frames_up(alink_t *a, const conf_t *c, double t)
 {
+    if (t - a->last_down >= FD_UP_CALM)
+        a->up_wait = FD_UP_GAP; /* calm for a while: normal pace again */
+    a->fd_last_change = a->last_up = t;
+    int half = half_fps(a, c);
+    if (a->isp_floor && a->fps_cap >= half) {
+        isp_floor(a, c, t, 0);
+        return;
+    }
     int up = a->fps_full;
     for (int i = FD_NSTEPS - 1; i >= 0; i--)
         if (fd_step(a->fps_full, i) > a->fps_cap) {
             up = fd_step(a->fps_full, i);
             break;
         }
+    if (a->isp_floor && up > half)
+        up = half; /* the ISP stage goes before the frame rate passes half */
     a->fps_cap = up;
     fps_update_r(a, c, "recover_fps");
-    a->fd_last_change = t;
 }
 
 /* ---- thermal throttling */
@@ -978,8 +1030,8 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
     } else if (clear) {
         if (a->clear_since < 0)
             a->clear_since = t;
-        if (!hold_up && a->fps_cap < a->fps_full && t - a->clear_since >= p->up_after) {
-            if (t - a->fd_last_change >= FD_UP_GAP)
+        if (!hold_up && degraded(a) && t - a->clear_since >= p->up_after) {
+            if (t - a->fd_last_change >= a->up_wait)
                 frames_up(a, c, t); /* frames first, the bitrate once they are all back */
         } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP &&
                    !(a->os_control && a->actual >= 0 && a->actual >= a->current * 1.024 * a->os_max * OS_BACK)) {
@@ -1027,9 +1079,11 @@ static void isp_keep(alink_t *a, const conf_t *c, double t)
     if (t < a->isp_next)
         return;
     a->isp_next = t + ISP_EVERY;
-    int any = 0;
-    for (int i = 0; i < ISP_N; i++)
+    int any = a->isp_floor, want[ISP_N];
+    for (int i = 0; i < ISP_N; i++) {
+        want[i] = a->isp_floor ? ISP_FLOOR[i] : a->isp[i];
         any |= a->isp[i] >= 0;
+    }
     if (!any)
         return;
     static char body[8192];
@@ -1037,17 +1091,41 @@ static void isp_keep(alink_t *a, const conf_t *c, double t)
         return; /* camera not up yet: next time */
     int changed = 0;
     for (int i = 0; i < ISP_N; i++) {
-        if (a->isp[i] < 0 || iq_value(body, ISP_KEYS[i].iq) == a->isp[i])
+        if (want[i] < 0 || iq_value(body, ISP_KEYS[i].iq) == want[i])
             continue;
         char path[64], reply[256];
-        snprintf(path, sizeof(path), "/api/v1/iq/set?%s=%d", ISP_KEYS[i].iq, a->isp[i]);
+        snprintf(path, sizeof(path), "/api/v1/iq/set?%s=%d", ISP_KEYS[i].iq, want[i]);
         if (http_get(c, path, reply, sizeof(reply)) == 200)
             changed = 1;
         else
-            fprintf(stderr, "camera %s:%s did not accept %s=%d\n", c->camera_host, c->camera_port, ISP_KEYS[i].iq, a->isp[i]);
+            fprintf(stderr, "camera %s:%s did not accept %s=%d\n", c->camera_host, c->camera_port, ISP_KEYS[i].iq, want[i]);
     }
-    if (changed)
+    if (changed && !a->isp_floor)
         report(a, "isp", a->current, NULL);
+}
+
+/* the floor's ISP stage on (the camera's values kept first) or off (configured values, else those kept, put back;
+ * a setting the camera had on auto comes back as a fixed value until waybeam restarts) */
+static void isp_floor(alink_t *a, const conf_t *c, double t, int on)
+{
+    static char body[8192];
+    if (on) {
+        int got = http_get(c, "/api/v1/iq", body, sizeof(body)) == 200;
+        for (int i = 0; i < ISP_N; i++)
+            a->isp_saved[i] = got ? iq_value(body, ISP_KEYS[i].iq) : -1;
+    }
+    a->isp_floor = on;
+    if (!on)
+        for (int i = 0; i < ISP_N; i++) {
+            if (a->isp[i] >= 0 || a->isp_saved[i] < 0)
+                continue; /* configured ones: isp_keep sets them back */
+            char path[64], reply[256];
+            snprintf(path, sizeof(path), "/api/v1/iq/set?%s=%d", ISP_KEYS[i].iq, a->isp_saved[i]);
+            http_get(c, path, reply, sizeof(reply));
+        }
+    a->isp_next = 0;
+    isp_keep(a, c, t); /* at once */
+    report(a, on ? "floor_isp" : "recover_isp", a->current, NULL);
 }
 
 /* ---- control port: HTTP or UDP, "enable=1&preset=quality" or "enable=1;preset=quality"; keys may be prefixed
@@ -1083,6 +1161,8 @@ static int command(alink_t *a, const conf_t *c, char *q)
                 a->os_ok_since = -1;
                 report(a, on ? "overshoot_control_on" : "overshoot_control_off", a->current, NULL);
                 if (!on && a->enabled && a->current) { /* give back what it was holding down */
+                    if (a->isp_floor)
+                        isp_floor(a, c, now(), 0);
                     if (a->fps_cap < a->fps_full) {
                         a->fps_cap = a->fps_full;
                         fps_update_r(a, c, "fps");
@@ -1205,7 +1285,8 @@ int main(int argc, char **argv)
     static conf_t c;
     conf_read(&c);
     static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9,
-                         .actual = -1, .fd_last_change = -1e9, .temp = -1, .therm_level = -1, .os_ok_since = -1 };
+                         .actual = -1, .fd_last_change = -1e9, .temp = -1, .therm_level = -1, .os_ok_since = -1,
+                         .up_wait = FD_UP_GAP, .last_up = -1e9, .last_down = -1e9 };
     const char *name = argc > 1 ? argv[1] : c.preset;
     if (!(a.p = preset_find(name))) {
         fprintf(stderr, "unknown preset %s (performance, balanced, quality), using balanced\n", name);

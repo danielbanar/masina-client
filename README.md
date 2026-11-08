@@ -45,20 +45,26 @@ Keyframes only make short spikes that drain within the interval, so they don't c
 - the network's own rules (modem_link's trigger fields) refine this: *edge* (a handover/release rule within 2 dB of
   firing) = no raising; *handover* = no cuts for 1 s after the cell changes; *no service* = no raising.
 
-**2. Bitrate floor -> frame rate.** The bitrate never goes below `ALINK_ENC_MIN` (1000 kbit/s: waybeam does not
+**2. Bitrate floor -> the ladder.** The bitrate never goes below `ALINK_ENC_MIN` (1000 kbit/s: waybeam does not
 encode below that). The encoder always gets the target; what it actually sends is normally not looked at. Only when
-the link is **congested and the bitrate is already at the floor**, modem_alink measures the real output and, if it
-is above the target, lowers the frame rate to the step expected to fit:
+the link is **congested and the bitrate is already at the floor**, modem_alink measures the real output and, while it
+is above the target, makes the picture cheaper one stage at a time (~1.3 s apart, each measured before the next):
 
 ```
-60 -> 40 -> 30 -> 20 -> 15 (-> 12 -> 10)     never below ALINK_MIN_FPS (default 15)
+bitrate -> floor  ->  frame rate to 30 (half)  ->  ISP stage  ->  frame rate lower (20, 15, 12, 10)
+                                                    despike 15     the step expected to fit,
+                                                    sharpness 0    never below ALINK_MIN_FPS (default 15)
+                                                    grayscale
 ```
 
-A detailed, moving scene can need far more than 1000 kbit/s at 60 fps even at the coarsest quantizer (measured at
-2816x1584: full-screen noise ~11 Mbit/s at a 1000 target, ~4 Mbit/s at 15 fps).
+The ISP stage keeps the camera's own despike/sharpness/grayscale values first and puts them back afterwards (or the
+`ALINK_ISP_*` values, if set). A dark (high-gain) or very detailed, moving scene can need far more than 1000 kbit/s
+at 60 fps even at the coarsest quantizer. Measured, dark scene at 1440p60 with overshoot control (see 4.), target
+4000: 0 s bitrate 4000 -> 1000, 1.4 s 30 fps, 2.7 s ISP stage, 3.9 s 15 fps: output ~21 -> ~2 Mbit/s.
 
-**3. Recovery.** When the link is clear again: **frame rate first** (one step every ~3 s; going down takes ~1.3 s per step), and only once it is back
-to full, the bitrate.
+**3. Recovery.** When the link is clear again, the same way back: frame rate up to 30, the ISP settings back, frame
+rate up to full, and only then the bitrate. One step every 3 s; a step up that has to be undone soon after doubles
+the wait (up to 60 s), 20 s without a step down brings it back to 3 s, so it does not bounce.
 
 **Measuring the output.** From the transmit counters (`/sys/class/net/<if>/statistics/tx_bytes`, `tx_packets`) of
 the interface the stream leaves on, minus IP/UDP/RTP headers per packet, averaged over 1 s. The interface is found
@@ -68,7 +74,7 @@ from waybeam's `outgoing.server` and the routing table (`wg0` in flight, `eth0` 
 
 **4. Optional: bitrate overshoot control** (`ALINK_BITRATE_OVERSHOOT_CONTROL`, off by default). Watches the output
 all the time, congested or not: at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5) it lowers the
-bitrate (by the overshoot, in one step, not below the floor), and at the floor the frame rate (~1.3 s later). Without
+bitrate (by the overshoot, in one step, not below the floor), and at the floor the ladder of 2. (~1.3 s per stage). Without
 modem stats it also recovers on its own: below 0.8 x the max for `up_after` s, frame rate first, then the bitrate in
 10 % steps back to the bitrate that was set (never above it). With modem stats the link decides when to go back up,
 but not while the output is still near the max.
@@ -167,6 +173,7 @@ ALINK;time=00:51:46;enabled=1;preset=balanced;bitrate=3000kbps;max=8000kbps;fps=
 | `fps` | frame rate the camera runs |
 | `actual` | measured output, kbit/s over 1 s (once the interface is known) |
 | `fps_cap` | frame rate allowed by the bitrate-floor / overshoot logic |
+| `isp_floor` | 1 = the ladder's ISP stage is on (despike 15, sharpness 0, grayscale) |
 | `temp`, `therm_fps` | SoC temperature and the thermal frame-rate cap (0 = none) |
 | `overshoot_control`, `overshoot_max` | current overshoot-control settings |
 | `isp_despike`, `isp_sharpness`, `isp_grayscale` | ISP settings kept on the camera (-1 = left alone) |
@@ -181,6 +188,7 @@ Every change is printed and sent to `GROUND_IP:2224` with `prev=` and `reason=`,
 | `congestion`, `recover`, `max` | bitrate cut / raised / clamped to the preset's max |
 | `external` | someone else changed the bitrate; carried on from there |
 | `floor_fps`, `recover_fps` | frame rate lowered at the bitrate floor / raised again |
+| `floor_isp`, `recover_isp` | the ladder's ISP stage on / off |
 | `overshoot` | bitrate cut by overshoot control |
 | `overshoot_control_on`, `overshoot_control_off`, `overshoot_max` | changed on the control port |
 | `thermal` | thermal frame-rate cap changed |
