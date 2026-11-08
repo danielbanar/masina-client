@@ -43,7 +43,11 @@
  * starts the ladder already at 2000 kbit/s, alongside the bitrate cuts (ALINK_LADDER_FROM overrides, 0 = only at the
  * floor). A dark, high-gain or very
  * detailed scene can need far more than the floor at the full frame rate. Recovering goes back the same way: the frame
- * rate up to half, the ISP settings back, the frame rate to full, and only then the bitrate.
+ * rate up to half, the ISP settings back, the frame rate to full, and only then the bitrate. But while the camera sends
+ * more than the target (the scene needs more than the floor), the target is first raised to what it sends, up to the
+ * preset's max, before each stage: the link is clear with that much already, so it adds nothing, and the stage after
+ * it is then measured against what the camera really sends (with overshoot control, a stage up at the floor's target
+ * reads as an overshoot at once and is undone, over and over, so the bitrate never came back).
  * ALINK_BITRATE_OVERSHOOT_CONTROL=true also watches the output all the time: at or above ALINK_BITRATE_OVERSHOOT_MAX
  * times the target (default 1.5) the bitrate goes down (by the overshoot, in one step, not below the floor),
  * and at the floor the frame rate, whether the link is congested or not. Without modem stats the way back is its own:
@@ -1051,11 +1055,22 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
         if (a->clear_since < 0)
             a->clear_since = t;
         if (!hold_up && degraded(a) && t - a->clear_since >= p->up_after) {
-            if (t - a->fd_last_change >= a->up_wait)
+            if (a->actual >= 0 && a->actual > a->current * 1.024 * FD_OVER && a->current < p->max_bitrate &&
+                t - a->last_change >= MIN_GAP && t - a->fd_last_change >= FD_WINDOW + FD_SETTLE) {
+                /* the camera sends more than the target and the link is clear with it: the target follows the output
+                 * first (adds no traffic), so the next stage is not an overshoot of a target the scene cannot meet */
+                if (apply(a, c, (long)(a->actual / 1.024), "recover", l))
+                    a->last_change = t;
+            } else if (t - a->fd_last_change >= a->up_wait)
                 frames_up(a, c, t); /* frames first, the bitrate once they are all back */
         } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP &&
-                   !(a->os_control && a->actual >= 0 && a->actual >= a->current * 1.024 * a->os_max * OS_BACK)) {
-            /* (with overshoot control: not while the output is still near the max, it would just overshoot again) */
+                   a->os_control && a->actual >= 0 && a->actual >= a->current * 1.024 * a->os_max * OS_BACK) {
+            /* with overshoot control and the output near the max: no step, it would just overshoot again, but the
+             * target follows the output (a scene that needs more than the target: the camera already sends that) */
+            if (t - a->last_change >= FD_WINDOW + FD_SETTLE && t - a->fd_last_change >= FD_WINDOW + FD_SETTLE &&
+                apply(a, c, (long)(a->actual / 1.024), "recover", l))
+                a->last_change = t;
+        } else if (!hold_up && a->current < p->max_bitrate && t - a->clear_since >= p->up_after && t - a->last_change >= MIN_GAP) {
             long step = (long)(a->current * p->up_step);
             if (t - a->cap_time >= CAP_VALID && step < p->max_bitrate * PROBE_STEP)
                 step = (long)(p->max_bitrate * PROBE_STEP);

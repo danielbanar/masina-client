@@ -64,7 +64,12 @@ at 60 fps even at the coarsest quantizer. Measured, dark scene at 1440p60 with o
 4000: 0 s bitrate 4000 -> 1000, 1.4 s 30 fps, 2.7 s ISP stage, 3.9 s 15 fps: output ~21 -> ~2 Mbit/s.
 
 **3. Recovery.** When the link is clear again, the same way back: frame rate up to 30, the ISP settings back, frame
-rate up to full, and only then the bitrate.
+rate up to full, and only then the bitrate. While the camera sends more than the target (a scene that needs more than
+the floor), the target is first raised to what it sends (up to the preset's max) before each stage: the link is
+already clear with that much, so it adds no traffic, and the next stage isn't read as an overshoot of a target the
+scene can't meet. Without this, overshoot control undid every stage up and the bitrate stayed at the floor; simulated
+(performance, link dropping to 0.7 Mbit/s for 10 s, very dark scene): back at 4000 kbit/s and 60 fps ~14 s after the
+link recovers, where it used to take ~33 s with overshoot control off and never got there with it on.
 
 The **performance** preset is more aggressive: its ladder already starts once the bitrate is at or below 2000 kbit/s,
 alongside the cuts (e.g. congested: 4000 -> 1860 kbit/s and 30 fps at once, where balanced goes 4000 -> 2280 at
@@ -81,8 +86,9 @@ from waybeam's `outgoing.server` and the routing table (`wg0` in flight, `eth0` 
 all the time, congested or not: at or above `ALINK_BITRATE_OVERSHOOT_MAX` x the target (default 1.5) it lowers the
 bitrate (by the overshoot, in one step, not below the floor), and at the floor the ladder of 2. (~1.3 s per stage). Without
 modem stats it also recovers on its own: below 0.8 x the max for `up_after` s, frame rate first, then the bitrate in
-10 % steps back to the bitrate that was set (never above it). With modem stats the link decides when to go back up,
-but not while the output is still near the max.
+10 % steps back to the bitrate that was set (never above it). With modem stats the link decides when to go back up;
+while the output is still near the max (1.2 x the target at the default 1.5) there are no steps, but the target is
+raised to what the camera sends (a scene that needs more than the target; it adds no traffic).
 
 **5. Thermal throttling.** Every 5 s the SoC temperature (`/sys/devices/virtual/mstar/msys/TEMP_R`) is looked up in
 `/etc/temp_profile.conf` and caps the frame rate. Back up only 2 °C below the hotter band. This wins over everything
