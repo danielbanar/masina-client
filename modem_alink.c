@@ -591,7 +591,8 @@ static int apply(alink_t *a, const conf_t *c, long target, const char *reason, c
     target = clamp(a, c, target);
     if (target == a->current)
         return 0;
-    if (!camera_set(c, "video0.bitrate", target)) {
+    /* live: /api/v1/set makes waybeam save its whole config, the ladder's lowered frame rate with it (it stayed at 15) */
+    if (!camera_set_live(c, "video0.bitrate", target)) {
         fprintf(stderr, "camera %s:%s did not accept bitrate %ld\n", c->camera_host, c->camera_port, target);
         return 0;
     }
@@ -635,7 +636,7 @@ static void release(alink_t *a, const conf_t *c, const char *reason)
         return;
     long prev = a->current;
     camera_sync(a, c); /* a change from someone else just now is what stays */
-    if (a->current != a->manual && camera_set(c, "video0.bitrate", a->manual))
+    if (a->current != a->manual && camera_set_live(c, "video0.bitrate", a->manual))
         a->current = a->manual;
     a->fps_cap = a->fps_full;
     isp_set(a, c, now(), ISP_OFF);
