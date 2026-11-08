@@ -63,7 +63,8 @@
  *
  * /etc/masina.conf: ALINK_ENABLED=true|false (default true), ALINK_PRESET (default performance), ALINK_CAMERA=host[:port]
  * (default 127.0.0.1:80), ALINK_MIN_BITRATE=<kbit/s> (default 1000), ALINK_MIN_FPS (default 15),
- * ALINK_LINK_LADDER=true|false (default true), ALINK_THERMAL=true|false (default true), ALINK_TEMP_PROFILE=<path>
+ * ALINK_LINK_LADDER=true|false (default true), ALINK_BUF_CLEAR=<KB> (default 100, 0 = off: no going back up until no
+ * stats line's buffer (ul_buf_max) has peaked at this or more for BUF_QUIET s), ALINK_THERMAL=true|false (default true), ALINK_TEMP_PROFILE=<path>
  * (default /etc/temp_profile.conf), ALINK_CONTROL_PORT (default 2226), GROUND_IP: every
  * change is sent there on port 2224 as "ALINK;time=...;enabled=...;preset=...;bitrate=...;...;reason=...".
  *
@@ -90,7 +91,7 @@
 #define MIN_GAP 0.2       /* s between changes: one per modem_link line at its 0.25 s interval, with some jitter */
 #define UP_MIN_STEP 25    /* kbit/s: smallest raise per step */
 #define CAP_VALID 10.0    /* s: how long the uplink rate seen while congested counts as what the link carries */
-#define PROBE_STEP 0.01   /* of the preset's max per line, after CAP_VALID without congestion */
+#define PROBE_STEP 0.02   /* of the preset's max per line, after CAP_VALID without congestion */
 #define FPS_DEFAULT 60    /* if the camera does not say */
 #define FPS_RETRY 10.0    /* s before trying again after the camera refused a frame rate */
 #define GET_EVERY 3.0     /* s between camera polls */
@@ -99,7 +100,8 @@
 #define EDGE_GAP 2.0      /* dB: a network rule this close to firing (search, handover, release): no raising */
 #define HO_GRACE 1.0      /* s after a cell change without cuts: the queue the switch built drains on the new cell */
 #define LADDER_DRAIN 2.0  /* s: no stage down while the standing queue is on course to be gone within this */
-#define UP_GAP 3.0        /* s between stages back up ... */
+#define BUF_QUIET 3.0     /* s without a line peaking at ALINK_BUF_CLEAR before anything goes back up */
+#define UP_GAP 1.5        /* s between stages back up ... */
 #define UP_MAX 60.0       /* ... doubled up to this after a stage up that had to be undone ... */
 #define UP_CALM 20.0      /* ... and back to UP_GAP after this long without a stage down */
 #define ISP_EVERY 3.0     /* s between checks that the camera still has the forced ISP values */
@@ -135,7 +137,7 @@ typedef struct {
  * so a 3 KB burst alone already reads as 50 ms */
 static const preset_t PRESETS[] = {
     /*               max     congested       aim          cut           clear     raise            standing  ladder */
-    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    3.0, 0.0075,     10, 3,    0.5 },  /* ~3 %/s */
+    { "performance", 4000,   50, 5, 50,      0.70, 0.5,   0.70, 0.25,   20, 5,    1.5, 0.0075,     10, 3,    0.5 },  /* ~3 %/s */
     { "balanced",    8000,   50, 10, 100,    0.80, 1.0,   0.85, 0.50,   25, 5,    2.0, 0.0125,     20, 5,    1.25 }, /* ~5 %/s */
     { "quality",     16000,  100, 20, 0,     0.90, 2.0,   0.90, 0.50,   40, 10,   1.0, 0.02,       40, 10,   1.25 }, /* ~8 %/s */
 };
@@ -187,6 +189,7 @@ typedef struct {
     int min_fps;      /* the ladder's lowest frame rate */
     int link_ladder;  /* ALINK_LINK_LADDER */
     int thermal;      /* ALINK_THERMAL */
+    double buf_clear; /* ALINK_BUF_CLEAR: KB, a line whose buffer peaks at this or more is not clear (0 = off) */
     char temp_profile[128];
 } conf_t;
 
@@ -201,6 +204,7 @@ static void conf_read(conf_t *c)
     c->min_fps = 15;
     c->link_ladder = 1;
     c->thermal = 1;
+    c->buf_clear = 100;
     snprintf(c->temp_profile, sizeof(c->temp_profile), "/etc/temp_profile.conf");
     FILE *f = fopen(MASINA_CONF, "r");
     if (f) {
@@ -219,6 +223,7 @@ static void conf_read(conf_t *c)
             if (sscanf(buf, "ALINK_THERMAL=%15s", on) == 1 && truthy(on) >= 0)
                 c->thermal = truthy(on);
             sscanf(buf, "ALINK_TEMP_PROFILE=%127s", c->temp_profile);
+            sscanf(buf, "ALINK_BUF_CLEAR=%lf", &c->buf_clear);
         }
         fclose(f);
     } else
@@ -329,9 +334,10 @@ static int iq_value(const char *body, const char *name)
 
 /* ---- modem_link stats */
 typedef struct {
-    int has_qdelay, has_queue, has_ul, has_standing, has_trigger, has_cell;
+    int has_qdelay, has_queue, has_ul, has_standing, has_trigger, has_cell, has_bmax;
     double qdelay, queue, ul_rate; /* ms, KB, Mbit/s */
     double qdelay_min, queue_min;  /* standing queue: smallest of the interval, ms and KB */
+    double queue_max;              /* the interval's peak buffer (ul_buf_max), KB */
     char trigger[48];              /* network rule closest to firing ("A2", "A5@1875/3500/6400") ... */
     double trigger_gap;            /* ... dB before its condition holds (<= 0: holds) */
     double earfcn, pci;            /* serving cell */
@@ -376,6 +382,7 @@ static int link_parse(const char *line, link_t *l)
     l->has_queue = kv_num(line, "ul_buf", &l->queue) || kv_num(line, "bsr", &l->queue); /* exact buffer if logged */
     l->has_ul = kv_num(line, "ul_rate", &l->ul_rate);
     l->has_standing = kv_num(line, "qdelay_min", &l->qdelay_min);
+    l->has_bmax = kv_num(line, "ul_buf_max", &l->queue_max);
     if (l->has_standing && !kv_num(line, "ul_buf_min", &l->queue_min)) /* only bsr on this modem: back from the delay */
         l->queue_min = l->qdelay_min / 1000 * (l->has_ul && l->ul_rate > 0.5 ? l->ul_rate : 0.5) * 1000 / 8; /* KB */
     l->has_trigger = kv_str(line, "trigger", l->trigger, sizeof(l->trigger)) && kv_num(line, "trigger_gap", &l->trigger_gap);
@@ -408,6 +415,7 @@ typedef struct {
     double change_queue, change_t;      /* standing queue (KB) at the last change while congested, and when */
     int temp, therm_fps, therm_level;   /* degrees C (-1 unknown), thermal frame-rate cap (0 none), profile line */
     double therm_next;
+    double buf_high_t;    /* last stats line whose buffer peaked at ALINK_BUF_CLEAR or more */
 } alink_t;
 
 static int udp_fd = -1;
@@ -844,6 +852,10 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
         clear = !l->has_queue || l->queue < p->qbytes_clear || (l->has_qdelay && l->qdelay < p->qdelay_clear);
         drain_kb = l->queue;
     }
+    if (c->buf_clear > 0 && l->has_bmax && l->queue_max >= c->buf_clear)
+        a->buf_high_t = t;
+    if (t - a->buf_high_t < BUF_QUIET)
+        clear = 0; /* the buffer peaked high (ALINK_BUF_CLEAR) within BUF_QUIET s: nothing goes back up yet */
     if (a->current > p->max_bitrate) {
         apply(a, c, p->max_bitrate, "max", l); /* someone else set more than the preset allows */
     } else if (congested) {
@@ -1026,7 +1038,7 @@ int main(int argc, char **argv)
 {
     static conf_t c;
     conf_read(&c);
-    static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9,
+    static alink_t a = { .camera_ok = -1, .stats_ok = 1, .last_change = -1e9, .clear_since = -1, .cap_time = -1e9, .buf_high_t = -1e9,
                          .stage_t = -1e9, .up_wait = UP_GAP, .last_up = -1e9, .last_down = -1e9, .temp = -1,
                          .therm_level = -1 };
     const char *name = argc > 1 ? argv[1] : c.preset;
