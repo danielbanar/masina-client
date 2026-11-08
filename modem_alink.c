@@ -50,12 +50,19 @@
  * ("<min>-<max> <fps|-> <scale of the full rate|-> <update s>", first matching line), back up THERM_HYST degrees below
  * the hotter band. This wins over everything and also works while disabled (replaces the thermal-throttle script).
  *
+ * Image (ISP) settings: ALINK_ISP_DESPIKE (0..15), ALINK_ISP_SHARPNESS (0..255) and ALINK_ISP_GRAYSCALE are set on the
+ * camera (/api/v1/iq/set: nr_despike, sharpness, color_to_gray) and kept there: every ISP_EVERY s they are read back
+ * and set again if waybeam lost them (it reloads the sensor bin, and with it the ISP defaults, on every start and
+ * reinit). Not set = left alone. A dark, high-gain scene is mostly noise; despike 15 + sharpness 0 halve its bitrate,
+ * grayscale halves it again (measured on SSC338Q/IMX415). Works while disabled too.
+ *
  * While enabled it owns the bitrate: a change from someone else (e.g. the ground station's bitrate slider) is where it
  * carries on from. The bitrate and frame rate the camera had when modem_alink took over, or the last change from
  * someone else, are restored when it is disabled or stops. No stats for 3 s: the bitrate is held.
  *
  * Control on port 2226 (all interfaces), HTTP or UDP: enable=0|1, preset=performance|balanced|quality,
- * bitrate_overshoot_control=0|1 and bitrate_overshoot_max=<x> (not kept: masina.conf sets them at start), keys
+ * bitrate_overshoot_control=0|1, bitrate_overshoot_max=<x>, isp_despike=<0..15>, isp_sharpness=<0..255> and
+ * isp_grayscale=0|1 (-1 = stop managing that one) (not kept: masina.conf sets them at start), keys
  * optionally prefixed "alink.". Both answer with a status line (ALINK;...;enabled=1;preset=...;bitrate=...).
  *   curl 'http://<drone>:2226/?preset=performance&enable=1'       any path; no query = status only
  *   echo 'preset=quality;enable=1' | nc -u -w1 <drone> 2226
@@ -64,7 +71,8 @@
  * (default 127.0.0.1:80), ALINK_MIN_BITRATE=<kbit/s> (default 1), ALINK_CONTROL_PORT (default 2226),
  * ALINK_ENC_MIN=<kbit/s> (default 1000), ALINK_MIN_FPS (default 15), ALINK_IFACE=auto|<ifname> (default auto),
  * ALINK_THERMAL=true|false (default true), ALINK_TEMP_PROFILE=<path> (default /etc/temp_profile.conf),
- * ALINK_BITRATE_OVERSHOOT_CONTROL=true|false (default false), ALINK_BITRATE_OVERSHOOT_MAX=<x> (default 1.5), GROUND_IP: every
+ * ALINK_BITRATE_OVERSHOOT_CONTROL=true|false (default false), ALINK_BITRATE_OVERSHOOT_MAX=<x> (default 1.5),
+ * ALINK_ISP_DESPIKE=<0..15>, ALINK_ISP_SHARPNESS=<0..255>, ALINK_ISP_GRAYSCALE=true|false (default: not set), GROUND_IP: every
  * change is sent there on port 2224 as "ALINK;time=...;enabled=...;preset=...;bitrate=...;...;reason=...".
  *
  * usage: modem_alink [performance|balanced|quality]      SIGINT/SIGTERM gives the camera back and exits
@@ -112,6 +120,15 @@
 #define THERM_TEMP "/sys/devices/virtual/mstar/msys/TEMP_R"
 #define THERM_HYST 2      /* degrees below a band before going back up from it */
 #define THERM_MAX 16      /* profile lines */
+#define ISP_EVERY 3.0     /* s between checks that the camera still has the ISP settings */
+#define ISP_N 3           /* managed ISP settings, see ISP_KEYS */
+
+/* ALINK_ISP_* / isp_* (control port) -> /api/v1/iq name and the highest value */
+static const struct { const char *ctl, *iq; int max; } ISP_KEYS[ISP_N] = {
+    { "isp_despike", "nr_despike", 15 },
+    { "isp_sharpness", "sharpness", 255 },
+    { "isp_grayscale", "color_to_gray", 1 },
+};
 
 /* ---- presets */
 typedef struct {
@@ -184,6 +201,7 @@ typedef struct {
     long enc_min;     /* kbit/s: the encoder's own floor, the bitrate goes no lower */
     int min_fps, thermal;
     int os_control;   /* ALINK_BITRATE_OVERSHOOT_CONTROL */
+    int isp[ISP_N];   /* ALINK_ISP_DESPIKE / _SHARPNESS / _GRAYSCALE, -1 = leave alone */
     double os_max;    /* ALINK_BITRATE_OVERSHOOT_MAX */
     char iface[32];   /* "auto": the route to waybeam's outgoing.server */
     char temp_profile[128];
@@ -201,6 +219,8 @@ static void conf_read(conf_t *c)
     c->min_fps = 15;
     c->thermal = 1;
     c->os_max = 1.5;
+    for (int i = 0; i < ISP_N; i++)
+        c->isp[i] = -1;
     snprintf(c->iface, sizeof(c->iface), "auto");
     snprintf(c->temp_profile, sizeof(c->temp_profile), "/etc/temp_profile.conf");
     FILE *f = fopen(MASINA_CONF, "r");
@@ -223,10 +243,17 @@ static void conf_read(conf_t *c)
             if (sscanf(buf, "ALINK_BITRATE_OVERSHOOT_CONTROL=%15s", on) == 1 && truthy(on) >= 0)
                 c->os_control = truthy(on);
             sscanf(buf, "ALINK_BITRATE_OVERSHOOT_MAX=%lf", &c->os_max);
+            sscanf(buf, "ALINK_ISP_DESPIKE=%d", &c->isp[0]);
+            sscanf(buf, "ALINK_ISP_SHARPNESS=%d", &c->isp[1]);
+            if (sscanf(buf, "ALINK_ISP_GRAYSCALE=%15s", on) == 1 && truthy(on) >= 0)
+                c->isp[2] = truthy(on);
         }
         fclose(f);
     } else
         fprintf(stderr, "warning: %s not found, using defaults\n", MASINA_CONF);
+    for (int i = 0; i < ISP_N; i++)
+        if (c->isp[i] > ISP_KEYS[i].max)
+            c->isp[i] = ISP_KEYS[i].max;
     if (c->os_max < 1.05)
         c->os_max = 1.05; /* the measurement is only good to a few % */
     char *colon = strrchr(camera, ':');
@@ -255,7 +282,7 @@ static int http_get(const conf_t *c, const char *path, char *body, size_t size)
     int ok = connect(fd, res->ai_addr, res->ai_addrlen) == 0;
     freeaddrinfo(res);
 
-    char buf[2048];
+    char buf[8192]; /* /api/v1/iq is ~4 KB */
     size_t n = 0;
     if (ok) {
         int len = snprintf(buf, sizeof(buf), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, c->camera_host);
@@ -418,6 +445,8 @@ typedef struct {
     double os_ok_since;   /* overshoot control: below OS_BACK x max since, -1 not */
     int os_control;       /* overshoot control on (ALINK_BITRATE_OVERSHOOT_CONTROL, control port) */
     double os_max;        /* its threshold (ALINK_BITRATE_OVERSHOOT_MAX, control port) */
+    int isp[ISP_N];       /* ISP settings kept on the camera (ALINK_ISP_*, control port), -1 = left alone */
+    double isp_next;      /* next check */
 } alink_t;
 
 static int udp_fd = -1;
@@ -452,6 +481,8 @@ static size_t status_core(const alink_t *a, char *o, size_t size)
         n += snprintf(o + n, size - n, ";temp=%dC;therm_fps=%d", a->temp, a->therm_fps);
     if (n < size)
         n += snprintf(o + n, size - n, ";overshoot_control=%d;overshoot_max=%.2f", a->os_control, a->os_max);
+    for (int i = 0; i < ISP_N && n < size; i++)
+        n += snprintf(o + n, size - n, ";%s=%d", ISP_KEYS[i].ctl, a->isp[i]);
     return n < size ? n : size - 1;
 }
 
@@ -462,7 +493,7 @@ static size_t num_or_na(char *o, size_t size, const char *key, int ok, double v,
 
 static void report(const alink_t *a, const char *reason, long prev, const link_t *l)
 {
-    char line[400];
+    char line[640];
     size_t n = status_core(a, line, sizeof(line));
     n += snprintf(line + n, sizeof(line) - n, ";prev=%ldkbps;reason=%s", prev, reason);
     if (l) {
@@ -975,6 +1006,51 @@ static void control(alink_t *a, const conf_t *c, const link_t *l, double t)
     fps_update(a, c); /* also follows a bitrate someone else set */
 }
 
+/* ---- ISP settings kept on the camera */
+
+/* the value of `name` in /api/v1/iq ({"name":{...,"value":N}} or {"name":{"value":true}}), -1 if not found */
+static int iq_value(const char *body, const char *name)
+{
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\":{", name);
+    const char *p = strstr(body, pat);
+    if (!p || !(p = strstr(p, "\"value\":")))
+        return -1;
+    p += 8;
+    if (!strncmp(p, "true", 4)) return 1;
+    if (!strncmp(p, "false", 5)) return 0;
+    return *p >= '0' && *p <= '9' ? atoi(p) : -1;
+}
+
+/* sets the managed ISP settings the camera does not have (waybeam drops them on every start/reinit) */
+static void isp_keep(alink_t *a, const conf_t *c, double t)
+{
+    if (t < a->isp_next)
+        return;
+    a->isp_next = t + ISP_EVERY;
+    int any = 0;
+    for (int i = 0; i < ISP_N; i++)
+        any |= a->isp[i] >= 0;
+    if (!any)
+        return;
+    static char body[8192];
+    if (http_get(c, "/api/v1/iq", body, sizeof(body)) != 200)
+        return; /* camera not up yet: next time */
+    int changed = 0;
+    for (int i = 0; i < ISP_N; i++) {
+        if (a->isp[i] < 0 || iq_value(body, ISP_KEYS[i].iq) == a->isp[i])
+            continue;
+        char path[64], reply[256];
+        snprintf(path, sizeof(path), "/api/v1/iq/set?%s=%d", ISP_KEYS[i].iq, a->isp[i]);
+        if (http_get(c, path, reply, sizeof(reply)) == 200)
+            changed = 1;
+        else
+            fprintf(stderr, "camera %s:%s did not accept %s=%d\n", c->camera_host, c->camera_port, ISP_KEYS[i].iq, a->isp[i]);
+    }
+    if (changed)
+        report(a, "isp", a->current, NULL);
+}
+
 /* ---- control port: HTTP or UDP, "enable=1&preset=quality" or "enable=1;preset=quality"; keys may be prefixed
  * "alink.", words without '=' (an "ALINK" prefix, "status") are ignored. Returns 0 if something was not understood. */
 static int command(alink_t *a, const conf_t *c, char *q)
@@ -1015,6 +1091,18 @@ static int command(alink_t *a, const conf_t *c, char *q)
                     if (a->current < a->manual)
                         apply(a, c, a->manual, "overshoot_control_off", NULL);
                 }
+            }
+        } else if (!strncmp(tok, "isp_", 4)) {
+            int i = 0;
+            while (i < ISP_N && strcmp(tok, ISP_KEYS[i].ctl))
+                i++;
+            char *end;
+            long x = strtol(v, &end, 10);
+            if (i == ISP_N || end == v || *end || x < -1 || x > ISP_KEYS[i].max) {
+                ok = 0;
+            } else {
+                a->isp[i] = (int)x; /* -1: left alone from now on (the value stays until waybeam restarts) */
+                a->isp_next = 0;    /* set it at once */
             }
         } else if (!strcmp(tok, "bitrate_overshoot_max")) {
             char *end;
@@ -1089,7 +1177,7 @@ static void control_http(alink_t *a, const conf_t *c)
         if (q && (end = strchr(q, ' ')))
             *end = '\0';
         int ok = !q || command(a, c, q + 1);
-        char status[320], resp[512];
+        char status[512], resp[768];
         status_reply(a, ok, status, sizeof(status));
         int len = snprintf(resp, sizeof(resp), "HTTP/1.0 %s\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n%s",
                            ok ? "200 OK" : "400 Bad Request", status);
@@ -1100,7 +1188,7 @@ static void control_http(alink_t *a, const conf_t *c)
 
 static void control_udp(alink_t *a, const conf_t *c)
 {
-    char buf[512], status[320];
+    char buf[512], status[512];
     struct sockaddr_storage from;
     socklen_t fromlen = sizeof(from);
     ssize_t n;
@@ -1127,6 +1215,7 @@ int main(int argc, char **argv)
     a.enabled = c.enabled;
     a.os_control = c.os_control;
     a.os_max = c.os_max;
+    memcpy(a.isp, c.isp, sizeof(a.isp));
     udp_open(c.ground_ip);
 
     int in = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -1196,6 +1285,7 @@ int main(int argc, char **argv)
         }
         if (a.current)
             thermal(&a, &c, t); /* also while disabled: it protects the camera */
+        isp_keep(&a, &c, t);    /* also while disabled: image settings, not the bitrate */
         if (a.enabled && a.current && a.stats_ok && t - a.last_stats >= STATS_TIMEOUT) {
             a.stats_ok = 0;
             report(&a, "no_data", a.current, NULL); /* the bitrate stays where it is until stats come back */

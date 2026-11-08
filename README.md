@@ -88,7 +88,15 @@ which reads the frame rate from `/etc/majestic.yaml` and does nothing under wayb
 ```
 (this is also the built-in default if the file is missing)
 
-**6. Ownership.** While enabled, modem_alink owns the bitrate: a change from someone else (e.g. the ground station's
+**6. Image (ISP) settings.** Optionally modem_alink keeps three ISP settings on the camera: despike
+(`nr_despike`, 0..15), sharpness (0..255) and grayscale (`color_to_gray`). waybeam loses them on every start and
+reinit (it reloads the sensor bin), so every 3 s they are read back from `/api/v1/iq` and set again if needed. A key
+that is not set is left alone. In a dark, high-gain scene the picture is mostly noise; measured at 1440p60 (target
+1000): defaults ~30 Mbit/s, despike 15 + sharpness 0 ~15 Mbit/s, with `fpv.noiseLevel=1` (waybeam 3DNR) ~6 Mbit/s,
+plus grayscale ~2 Mbit/s. They soften the picture, so set them for the conditions you fly in, or switch them over the
+control port. Works while modem_alink is disabled too.
+
+**7. Ownership.** While enabled, modem_alink owns the bitrate: a change from someone else (e.g. the ground station's
 bitrate slider) is where it carries on from. The bitrate and frame rate the camera had when it took over, or the
 last change from someone else, are given back when it is disabled or stops (SIGINT/SIGTERM). No stats for 3 s: the
 bitrate is held. Frame-rate changes use `/api/v1/live/set` (not written to flash).
@@ -115,6 +123,9 @@ bitrate is held. Frame-rate changes use `/api/v1/live/set` (not written to flash
 | `ALINK_IFACE` | `auto` | interface to measure the output on; `auto` = route to waybeam's `outgoing.server` |
 | `ALINK_BITRATE_OVERSHOOT_CONTROL` | `false` | watch the output all the time (see 4.) |
 | `ALINK_BITRATE_OVERSHOOT_MAX` | `1.5` | output/target that triggers it (not below 1.05) |
+| `ALINK_ISP_DESPIKE` | not set | ISP despike 0..15 kept on the camera (see 6.) |
+| `ALINK_ISP_SHARPNESS` | not set | ISP sharpness 0..255 kept on the camera |
+| `ALINK_ISP_GRAYSCALE` | not set | `true` / `false`: grayscale kept on the camera |
 | `ALINK_THERMAL` | `true` | thermal throttling |
 | `ALINK_TEMP_PROFILE` | `/etc/temp_profile.conf` | thermal profile |
 | `GROUND_IP` | | every change is reported there on port 2224 |
@@ -130,11 +141,15 @@ separated by `&` or `;`. No query = status only. A bad key or value answers `err
 | `preset` | `performance` / `balanced` / `quality` |
 | `bitrate_overshoot_control` | `0` / `1` (turning it off gives back the frames and bitrate it held down) |
 | `bitrate_overshoot_max` | e.g. `1.8` |
+| `isp_despike` | `0`..`15`, `-1` = stop managing it (the value stays until waybeam restarts) |
+| `isp_sharpness` | `0`..`255`, `-1` = stop managing it |
+| `isp_grayscale` | `0` / `1`, `-1` = stop managing it |
 
 ```sh
 curl 'http://<drone>:2226/'                                         # status
 curl 'http://<drone>:2226/?preset=performance&enable=1'
 curl 'http://<drone>:2226/?bitrate_overshoot_control=1&bitrate_overshoot_max=1.8'
+curl 'http://<drone>:2226/?isp_despike=15&isp_sharpness=0&isp_grayscale=1'   # dark: less noise, fewer bits
 echo 'preset=quality;enable=1' | nc -u -w1 <drone> 2226
 ```
 
@@ -154,6 +169,7 @@ ALINK;time=00:51:46;enabled=1;preset=balanced;bitrate=3000kbps;max=8000kbps;fps=
 | `fps_cap` | frame rate allowed by the bitrate-floor / overshoot logic |
 | `temp`, `therm_fps` | SoC temperature and the thermal frame-rate cap (0 = none) |
 | `overshoot_control`, `overshoot_max` | current overshoot-control settings |
+| `isp_despike`, `isp_sharpness`, `isp_grayscale` | ISP settings kept on the camera (-1 = left alone) |
 | `manual` | bitrate given back on disable/exit (status reply only) |
 
 Every change is printed and sent to `GROUND_IP:2224` with `prev=` and `reason=`, plus the link fields (`qdelay`,
@@ -168,6 +184,7 @@ Every change is printed and sent to `GROUND_IP:2224` with `prev=` and `reason=`,
 | `overshoot` | bitrate cut by overshoot control |
 | `overshoot_control_on`, `overshoot_control_off`, `overshoot_max` | changed on the control port |
 | `thermal` | thermal frame-rate cap changed |
+| `isp` | ISP settings (re)applied, e.g. after waybeam restarted |
 | `fps` | frame rate set back (e.g. after a cap was lifted) |
 | `preset` | preset changed |
 | `edge`, `handover`, `no_service`, `service` | network events from modem_link |
@@ -176,7 +193,8 @@ Every change is printed and sent to `GROUND_IP:2224` with `prev=` and `reason=`,
 ### waybeam API used
 
 `GET /api/v1/get?video0.bitrate`, `?video0.fps`, `?outgoing.server`, `GET /api/v1/set?video0.bitrate=<kbit/s>`,
-`GET /api/v1/live/set?video0.fps=<n>` (falls back to `/api/v1/set` on cameras without `live/set`).
+`GET /api/v1/live/set?video0.fps=<n>` (falls back to `/api/v1/set` on cameras without `live/set`),
+`GET /api/v1/iq`, `GET /api/v1/iq/set?nr_despike=|sharpness=|color_to_gray=` (ISP settings, only when set).
 
 ### Building
 
