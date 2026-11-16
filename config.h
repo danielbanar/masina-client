@@ -13,6 +13,7 @@ struct Config
     uint32_t rcChannels = 12;
     std::string serialPort = "/dev/ttyS2";
     uint32_t debug = 0; // 0 = off, 1 = console, 2 = file
+    uint32_t mspPollMs = 1000;
 
     bool readConfig(const std::string& filename);
     void print() const;

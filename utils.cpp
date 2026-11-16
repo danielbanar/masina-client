@@ -24,6 +24,7 @@ void Config::print() const
     std::cout << "  rcChannels: " << rcChannels << std::endl;
     std::cout << "  serialPort: " << serialPort << std::endl;
     std::cout << "  debug: " << debug << std::endl;
+    std::cout << "  mspPollMs: " << mspPollMs << std::endl;
 }
 
 bool Config::readConfig(const std::string& filename)
@@ -61,6 +62,8 @@ bool Config::readConfig(const std::string& filename)
             else if (key == "DEBUG")
                 debug = std::stoi(value);
                 // debug 0: off, 1: console, 2+: file (opened on the first log)
+            else if (key == "MSP_POLL_MS" || key == "mspPollMs")
+                mspPollMs = std::stoi(value);
         }
     }
     return true;

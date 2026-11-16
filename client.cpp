@@ -179,6 +179,18 @@ int main()
                         crsfPayload[24] = ((crsfChannels[15] >> 3) & 0xFF);
                         crsfPayload[25] = CRC8(crsfPayload, 2, 0x18 - 1);
                         ssize_t bytes_written = write(serialPort, crsfPayload, 26);
+            
+                        static auto lastMspPoll = currentTime;
+                        if (gConfig.mspPollMs > 0 && bytes_written == 26 &&
+                            std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastMspPoll).count() >= gConfig.mspPollMs)
+                        {
+                            // sync, length, type 0x7A, to the FC (C8) from the radio (EA), MSPv1 start, size 1,
+                            // MSP_WP, waypoint 255, CRC8 DVB-S2 of type..data
+                            static const uint8_t mspWpRequest[10] = {0xC8, 0x08, 0x7A, 0xC8, 0xEA, 0x30, 0x01, 0x76, 0xFF, 0xEA};
+                            if (write(serialPort, mspWpRequest, sizeof(mspWpRequest)) == (ssize_t)sizeof(mspWpRequest))
+                                Log(gConfig.debug, "Sent: MSP_WP #255");
+                            lastMspPoll = currentTime;
+                        }
                         /*static uint8_t linkPayload[15] = "\xC8\x0C\x14\x10\x17\x64\x05\x00\x01\x01\x00\x00\x00\x59"; //Dummy data
                         bytes_written = write(serialPort, linkPayload, 14);*/
                         lastSentPayload = currentTime;
